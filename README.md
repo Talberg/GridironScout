@@ -2,7 +2,7 @@
 
 Gridiron Scout is an Expo / React Native app that can also be exported as a static website.
 
-Use the horizontal scouting tabs to review **Field Zones**, **Down & Distance**, **Formations**, **Back Sets**, and **Play Families**, then open the **DC Quiz Engine**, **Beebe Call Sheet**, or **Snap Log**. The left-side menu contains **Record Data**, **Settings**, and the team schedule. Add schedule entries with a team/opponent name and an optional week; each has a separate playbook on the current device. On the CSV upload page, choose a scheduled week as the import destination; the imported data is saved to that entry, makes it active, and selects Local mode so it remains available even if Cloud mode was previously selected.
+Use the scouting tabs to review **Field Zones**, **Down & Distance**, **Formations**, **Back Sets**, and **Play Families**, then open the **DC Quiz Engine**, **Beebe Call Sheet**, or **Snap Log**. On small screens, choose a view from the compact scouting dropdown. The left-side menu contains **Record Data**, **Settings**, and the team schedule. Add schedule entries with a team/opponent name and an optional week; each has a separate playbook on the current device. On the CSV upload page, choose a scheduled week as the import destination; the imported data is saved to that entry, makes it active, and selects Local mode so it remains available even if Cloud mode was previously selected.
 
 Down-and-distance filters and tendency groups use the distance-to-go buckets Short (S, 1–3 yards), Medium (M, 4–6 yards), and Long (L, 7+ yards), grouped separately by down. Goal-to-go is treated as short.
 

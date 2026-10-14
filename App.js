@@ -9,6 +9,7 @@ import {
   Text,
   View,
   TouchableOpacity,
+  useWindowDimensions,
   Modal,
   FlatList,
   Pressable,
@@ -637,6 +638,8 @@ function QuizEngine({ plays }) {
 }
 
 export default function App() {
+  const { width: windowWidth } = useWindowDimensions();
+  const isCompactScreen = windowWidth < 760;
   const appConfig = Constants.expoConfig?.extra || {};
   const googleWebClientId = appConfig.googleWebClientId || '';
   const googleIosClientId = appConfig.googleIosClientId || '';
@@ -706,6 +709,7 @@ export default function App() {
   const [clearConfirmVisible, setClearConfirmVisible] = useState(false);
   const [activeSection, setActiveSection] = useState('dashboard');
   const [activeScoutTab, setActiveScoutTab] = useState('formations');
+  const [scoutTabPickerVisible, setScoutTabPickerVisible] = useState(false);
   const [recordForm, setRecordForm] = useState({
     clip: '',
     down: '1',
@@ -1433,31 +1437,97 @@ export default function App() {
       </View>
 
       {activeSection === 'dashboard' && (
-        <ScrollView
-          horizontal
-          showsHorizontalScrollIndicator={false}
-          style={styles.scoutTabBar}
-          contentContainerStyle={styles.scoutTabList}
-        >
-          {SCOUT_TABS.map((tab) => {
-            const selected = activeScoutTab === tab.id;
-            return (
+        isCompactScreen ? (
+          <>
+            <View style={styles.scoutCompactBar}>
               <TouchableOpacity
-                key={tab.id}
-                style={[styles.scoutTab, selected && styles.scoutTabActive]}
-                onPress={() => setActiveScoutTab(tab.id)}
-                accessibilityRole="tab"
-                accessibilityLabel={tab.label}
-                accessibilityState={{ selected }}
+                style={styles.scoutCompactButton}
+                onPress={() => setScoutTabPickerVisible(true)}
+                accessibilityRole="button"
+                accessibilityLabel={`Choose scouting view, currently ${activeScoutTabConfig.label}`}
+                accessibilityState={{ expanded: scoutTabPickerVisible }}
               >
-                <Text style={[styles.scoutTabIcon, { color: tab.accent }]}>{tab.icon}</Text>
-                <Text style={[styles.scoutTabText, selected && styles.scoutTabTextActive]}>
-                  {tab.label}
-                </Text>
+                <View style={styles.scoutCompactSelection}>
+                  <Text style={[styles.scoutCompactIcon, { color: activeScoutTabConfig.accent }]}>
+                    {activeScoutTabConfig.icon}
+                  </Text>
+                  <Text style={styles.scoutCompactLabel}>{activeScoutTabConfig.label}</Text>
+                </View>
+                <Text style={styles.scoutCompactChevron}>⌄</Text>
               </TouchableOpacity>
-            );
-          })}
-        </ScrollView>
+            </View>
+            <Modal
+              visible={scoutTabPickerVisible}
+              transparent
+              animationType="fade"
+              onRequestClose={() => setScoutTabPickerVisible(false)}
+            >
+              <View style={styles.scoutPickerOverlay}>
+                <Pressable
+                  style={styles.scoutPickerBackdrop}
+                  onPress={() => setScoutTabPickerVisible(false)}
+                  accessibilityRole="button"
+                  accessibilityLabel="Close scouting view selector"
+                />
+                <View style={styles.scoutPickerPanel}>
+                  <Text style={styles.scoutPickerTitle}>Choose a scouting view</Text>
+                  <ScrollView contentContainerStyle={styles.scoutPickerList}>
+                    {SCOUT_TABS.map((tab) => {
+                      const selected = activeScoutTab === tab.id;
+                      return (
+                        <TouchableOpacity
+                          key={tab.id}
+                          style={[styles.scoutPickerOption, selected && styles.scoutPickerOptionActive]}
+                          onPress={() => {
+                            setActiveScoutTab(tab.id);
+                            setScoutTabPickerVisible(false);
+                          }}
+                          accessibilityRole="button"
+                          accessibilityLabel={`Show ${tab.label}`}
+                          accessibilityState={{ selected }}
+                        >
+                          <Text style={[styles.scoutPickerOptionIcon, { color: tab.accent }]}>
+                            {tab.icon}
+                          </Text>
+                          <Text style={[styles.scoutPickerOptionText, selected && styles.scoutPickerOptionTextActive]}>
+                            {tab.label}
+                          </Text>
+                          {selected && <Text style={styles.scoutPickerCheck}>✓</Text>}
+                        </TouchableOpacity>
+                      );
+                    })}
+                  </ScrollView>
+                </View>
+              </View>
+            </Modal>
+          </>
+        ) : (
+          <ScrollView
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            style={styles.scoutTabBar}
+            contentContainerStyle={styles.scoutTabList}
+          >
+            {SCOUT_TABS.map((tab) => {
+              const selected = activeScoutTab === tab.id;
+              return (
+                <TouchableOpacity
+                  key={tab.id}
+                  style={[styles.scoutTab, selected && styles.scoutTabActive]}
+                  onPress={() => setActiveScoutTab(tab.id)}
+                  accessibilityRole="tab"
+                  accessibilityLabel={tab.label}
+                  accessibilityState={{ selected }}
+                >
+                  <Text style={[styles.scoutTabIcon, { color: tab.accent }]}>{tab.icon}</Text>
+                  <Text style={[styles.scoutTabText, selected && styles.scoutTabTextActive]}>
+                    {tab.label}
+                  </Text>
+                </TouchableOpacity>
+              );
+            })}
+          </ScrollView>
+        )
       )}
 
       {activeSection === 'dashboard' ? (
@@ -2229,6 +2299,73 @@ const styles = StyleSheet.create({
   scoutTabIcon: { fontSize: 13, fontWeight: '900' },
   scoutTabText: { color: '#aab8cc', fontSize: 11, fontWeight: '700' },
   scoutTabTextActive: { color: theme.white },
+  scoutCompactBar: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    backgroundColor: '#030817',
+    borderBottomWidth: 1,
+    borderBottomColor: theme.border,
+  },
+  scoutCompactButton: {
+    minHeight: 44,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 13,
+    backgroundColor: theme.panel,
+    borderWidth: 1,
+    borderColor: '#334155',
+    borderRadius: 10,
+  },
+  scoutCompactSelection: { flexDirection: 'row', alignItems: 'center', gap: 9 },
+  scoutCompactIcon: { fontSize: 14, fontWeight: '900' },
+  scoutCompactLabel: { color: theme.white, fontSize: 13, fontWeight: '700' },
+  scoutCompactChevron: { color: theme.muted, fontSize: 18, lineHeight: 20 },
+  scoutPickerOverlay: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 20,
+    backgroundColor: 'rgba(2, 8, 23, 0.72)',
+  },
+  scoutPickerBackdrop: { ...StyleSheet.absoluteFillObject },
+  scoutPickerPanel: {
+    width: '100%',
+    maxWidth: 420,
+    maxHeight: '80%',
+    padding: 14,
+    backgroundColor: theme.panel,
+    borderWidth: 1,
+    borderColor: '#334155',
+    borderRadius: 14,
+  },
+  scoutPickerTitle: {
+    color: theme.white,
+    fontSize: 14,
+    fontWeight: '800',
+    paddingHorizontal: 4,
+    paddingBottom: 10,
+  },
+  scoutPickerList: { gap: 6 },
+  scoutPickerOption: {
+    minHeight: 46,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingHorizontal: 11,
+    backgroundColor: '#0b1220',
+    borderWidth: 1,
+    borderColor: 'transparent',
+    borderRadius: 9,
+  },
+  scoutPickerOptionActive: {
+    backgroundColor: 'rgba(251, 191, 36, 0.1)',
+    borderColor: 'rgba(251, 191, 36, 0.55)',
+  },
+  scoutPickerOptionIcon: { width: 20, fontSize: 14, fontWeight: '900', textAlign: 'center' },
+  scoutPickerOptionText: { color: theme.text, flex: 1, fontSize: 12, fontWeight: '700' },
+  scoutPickerOptionTextActive: { color: theme.white },
+  scoutPickerCheck: { color: theme.amber, fontSize: 15, fontWeight: '900' },
   scoutContent: { padding: 20, gap: 16, width: '100%', maxWidth: 1500, alignSelf: 'center' },
   scoutSummary: {
     flexDirection: 'row',

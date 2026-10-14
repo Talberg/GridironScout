@@ -1,5 +1,6 @@
 import React from 'react';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react-native';
+import { Dimensions } from 'react-native';
 import * as Google from 'expo-auth-session/providers/google';
 import * as DocumentPicker from 'expo-document-picker';
 import App from './App';
@@ -35,6 +36,15 @@ const openSection = (section) => {
   fireEvent.press(screen.getByRole('button', { name: 'Open team menu' }));
   fireEvent.press(screen.getByRole('button', { name: section }));
 };
+
+const setWindowWidth = (width) => {
+  const metrics = { width, height: 800, scale: 1, fontScale: 1 };
+  Dimensions.set({ window: metrics, screen: metrics });
+};
+
+beforeEach(() => {
+  setWindowWidth(1024);
+});
 
 describe('Record Data', () => {
   beforeEach(async () => {
@@ -118,6 +128,29 @@ describe('Scouting tabs', () => {
 
     fireEvent.press(screen.getByRole('tab', { name: 'Snap Log' }));
     expect(screen.getByText('All imported and recorded scouting snaps.')).toBeTruthy();
+  });
+
+  it('uses a compact selector on small screens and switches the active view', () => {
+    setWindowWidth(390);
+    render(<App />);
+
+    expect(screen.queryByRole('tab')).toBeNull();
+    fireEvent.press(screen.getByRole('button', { name: 'Choose scouting view, currently Formations' }));
+    expect(screen.getByText('Choose a scouting view')).toBeTruthy();
+
+    fireEvent.press(screen.getByRole('button', { name: 'Show Down & Distance' }));
+
+    expect(screen.getByText('Down & Distance Tendencies & Alignment Keys')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Choose scouting view, currently Down & Distance' })).toBeTruthy();
+    expect(screen.queryByText('Choose a scouting view')).toBeNull();
+  });
+
+  it('keeps horizontal tabs on larger screens', () => {
+    setWindowWidth(1024);
+    render(<App />);
+
+    expect(screen.getByRole('tab', { name: 'Formations' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Choose scouting view, currently Formations' })).toBeNull();
   });
 });
 
