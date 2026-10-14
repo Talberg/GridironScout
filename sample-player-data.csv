@@ -1,0 +1,9 @@
+Clip,Down,Distance,Yardline,Field_Zone,Formation,Back_Set,Play_Family,Play_Type,Gain,Penalty
+1,1,10,OWN 25,Backed Up,Trips Right,Gun Pistol,Inside Zone,RUN,4,NO
+2,2,6,OWN 29,Backed Up,Trips Right,Gun Pistol,Outside Zone,RUN,5,NO
+3,3,1,OWN 35,Own Territory,2x2 Spread,Gun Offset Weak,Mesh Pass,PASS,8,NO
+4,1,10,OPP 45,Opp Territory,Bunch Right,Gun Pistol,Play Action Post,PASS,18,NO
+5,2,3,OPP 24,Red Zone,I-Form,Under Center,Counter,RUN,4,NO
+6,1,G,OPP 7,Goal to Go,Heavy Jumbo,Under Center,QB Sneak,RUN,1,NO
+7,3,8,OWN 32,Own Territory,Empty,Gun Empty,Drive Concept,PASS,11,NO
+8,2,5,OPP 22,Red Zone,Trips Right,Gun Offset Weak,Holding,PASS,0,YES
