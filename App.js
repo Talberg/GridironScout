@@ -1,5 +1,6 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Animated,
   SafeAreaView,
   ScrollView,
   Platform,
@@ -30,6 +31,13 @@ import {
   getDownDistanceBucket,
   refreshDownDistanceBuckets,
 } from './downDistance';
+import {
+  createTeamScheduleEntry,
+  DEFAULT_TEAM,
+  getTeamDatasetKey,
+  isStoredTeamSchedule,
+  TEAM_SCHEDULE_KEY,
+} from './teamSchedule';
 
 WebBrowser.maybeCompleteAuthSession();
 
@@ -109,6 +117,16 @@ const theme = {
 const LOCAL_DATA_KEY = 'gridiron-scout.dataset.v1';
 const LOCAL_CSV_URL_KEY = 'gridiron-scout.cloud-csv-url.v1';
 const STORAGE_MODE_KEY = 'gridiron-scout.storage-mode.v1';
+const SCOUT_TABS = [
+  { id: 'field-zones', label: 'Field Zones', icon: '◉', field: 'fieldZone', accent: theme.rose },
+  { id: 'down-distance', label: 'Down & Distance', icon: '↕', field: 'downDistBucket', accent: theme.amber },
+  { id: 'formations', label: 'Formations', icon: '▦', field: 'formation', accent: theme.cyan },
+  { id: 'back-sets', label: 'Back Sets', icon: '⇄', field: 'backSet', accent: theme.emerald },
+  { id: 'play-families', label: 'Play Families', icon: '⌘', field: 'playFamily', accent: theme.purple },
+  { id: 'quiz', label: 'DC Quiz Engine', icon: '♟', accent: theme.amber },
+  { id: 'call-sheet', label: 'Beebe Call Sheet', icon: '⬡', accent: theme.emerald },
+  { id: 'snap-log', label: 'Snap Log', icon: '▤', accent: theme.cyan },
+];
 
 function parseCsv(content) {
   const rows = [];
@@ -308,16 +326,6 @@ function formatPct(part, total) {
   return `${Math.round((part / total) * 100)}%`;
 }
 
-function StatCard({ label, value, sublabel, accent = '#fff' }) {
-  return (
-    <View style={[styles.statCard, { borderColor: theme.border }]}>
-      <Text style={styles.statLabel}>{label}</Text>
-      <Text style={[styles.statValue, { color: accent }]}>{value}</Text>
-      <Text style={styles.statSub}>{sublabel}</Text>
-    </View>
-  );
-}
-
 function RecordField({ label, value, onChangeText, placeholder, keyboardType = 'default', style }) {
   return (
     <View style={[styles.recordField, style]}>
@@ -331,52 +339,6 @@ function RecordField({ label, value, onChangeText, placeholder, keyboardType = '
         style={styles.recordInput}
       />
     </View>
-  );
-}
-
-function FilterSelect({ label, value, options, onPress }) {
-  return (
-    <View style={styles.filterBlock}>
-      <Text style={styles.filterLabel}>{label}</Text>
-      <TouchableOpacity style={styles.filterButton} onPress={onPress}>
-        <Text style={styles.filterValue}>{value}</Text>
-        <Text style={styles.filterChevron}>▾</Text>
-      </TouchableOpacity>
-    </View>
-  );
-}
-
-function DropdownModal({ visible, title, options, selectedValue, onClose, onSelect }) {
-  return (
-    <Modal transparent visible={visible} animationType="fade" onRequestClose={onClose}>
-      <Pressable style={styles.modalOverlay} onPress={onClose}>
-        <Pressable style={styles.modalCard} onPress={() => {}}>
-          <View style={styles.modalHeader}>
-            <Text style={styles.modalTitle}>{title}</Text>
-            <TouchableOpacity onPress={onClose}>
-              <Text style={styles.closeText}>Close</Text>
-            </TouchableOpacity>
-          </View>
-          <ScrollView style={styles.modalList}>
-            <TouchableOpacity
-              style={[styles.modalItem, selectedValue === 'ALL' && styles.modalItemActive]}
-              onPress={() => { onSelect('ALL'); onClose(); }}
-            >
-              <Text style={styles.modalItemText}>All</Text>
-            </TouchableOpacity>
-            {options.map((option) => (
-              <TouchableOpacity
-                key={option}
-                style={[styles.modalItem, selectedValue === option && styles.modalItemActive]}
-                onPress={() => { onSelect(option); onClose(); }}
-              >
-                <Text style={styles.modalItemText}>{option}</Text>
-              </TouchableOpacity>
-            ))}
-          </ScrollView>
-        </Pressable>
-      </Pressable>
-    </Modal>
   );
 }
 
@@ -495,6 +457,185 @@ function HierarchyTree({ plays }) {
   );
 }
 
+function TendencyCards({ plays, field, title, accent }) {
+  const groups = plays.reduce((result, play) => {
+    const key = play[field] || 'Unknown';
+    if (!result[key]) {
+      result[key] = { key, count: 0, runs: 0, passes: 0, totalGain: 0, families: {}, backSets: {} };
+    }
+    const group = result[key];
+    group.count += 1;
+    group.totalGain += play.gain;
+    if (play.playType === 'RUN') group.runs += 1;
+    else group.passes += 1;
+    group.families[play.playFamily] = (group.families[play.playFamily] || 0) + 1;
+    group.backSets[play.backSet] = (group.backSets[play.backSet] || 0) + 1;
+    return result;
+  }, {});
+  const orderedGroups = Object.values(groups).sort((first, second) => (
+    second.count - first.count || first.key.localeCompare(second.key)
+  ));
+
+  return (
+    <View style={styles.panel}>
+      <View style={styles.scoutPanelHeader}>
+        <View>
+          <Text style={styles.scoutPanelTitle}>{title} Tendencies & Alignment Keys</Text>
+          <Text style={styles.scoutPanelSubtitle}>
+            Scouting tendencies from {compactNumber(plays.length)} matching snaps.
+          </Text>
+        </View>
+      </View>
+      {orderedGroups.length === 0 ? (
+        <Text style={styles.emptyText}>No matching plays. Import a CSV or record a play to see tendencies.</Text>
+      ) : (
+        <View style={styles.tendencyGrid}>
+          {orderedGroups.map((group) => {
+            const runRate = Math.round((group.runs / group.count) * 100);
+            const topFamily = Object.entries(group.families).sort((first, second) => (
+              second[1] - first[1] || first[0].localeCompare(second[0])
+            ))[0];
+            const topBackSet = Object.entries(group.backSets).sort((first, second) => (
+              second[1] - first[1] || first[0].localeCompare(second[0])
+            ))[0];
+            return (
+              <View key={group.key} style={styles.tendencyCard}>
+                <View style={styles.tendencyCardHeading}>
+                  <Text style={styles.tendencyCardTitle}>{group.key}</Text>
+                  <View style={styles.snapBadge}>
+                    <Text style={styles.snapBadgeText}>{compactNumber(group.count)} SNAPS</Text>
+                  </View>
+                </View>
+                <Text style={styles.tendencyCardSubtitle}>
+                  {topBackSet ? `${topBackSet[0]} · ${formatPct(topBackSet[1], group.count)} of snaps` : 'No back-set data'}
+                </Text>
+                <View style={styles.runPassRow}>
+                  <View style={styles.runPassTrack}>
+                    <View style={[styles.runPassRun, { width: `${runRate}%` }]} />
+                    <View style={[styles.runPassPass, { width: `${100 - runRate}%` }]} />
+                  </View>
+                  <Text style={styles.runPassLabel}>{runRate}% R / {100 - runRate}% P</Text>
+                </View>
+                <View style={styles.tendencyDivider} />
+                <Text style={styles.tendencyEyebrow}>MOST COMMON PLAY FAMILY</Text>
+                <Text style={[styles.tendencyFamily, { color: accent }]}>{topFamily?.[0] || 'No play-family data'}</Text>
+                <View style={styles.tendencyInsight}>
+                  <Text style={styles.tendencyInsightIcon}>✦</Text>
+                  <Text style={styles.tendencyInsightText}>
+                    {group.count} snaps · {group.runs} runs · {group.passes} passes · {(group.totalGain / group.count).toFixed(1)} yd avg gain
+                  </Text>
+                </View>
+              </View>
+            );
+          })}
+        </View>
+      )}
+    </View>
+  );
+}
+
+function SnapLog({ plays }) {
+  return (
+    <View style={styles.panel}>
+      <View style={styles.scoutPanelHeader}>
+        <View>
+          <Text style={styles.scoutPanelTitle}>Snap Log</Text>
+          <Text style={styles.scoutPanelSubtitle}>All imported and recorded scouting snaps.</Text>
+        </View>
+        <Text style={styles.panelMeta}>{compactNumber(plays.length)} snaps</Text>
+      </View>
+      {!plays.length ? (
+        <Text style={styles.emptyText}>No snaps to show. Import a CSV or record a play.</Text>
+      ) : (
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.tableWrap}>
+          <View style={styles.table}>
+            <View style={styles.tableHeaderRow}>
+              {['Clip #', 'Down & Distance', 'Field Zone / Yardline', 'Formation', 'Back Set', 'Play Family', 'Result / Type', 'Gain'].map((head) => (
+                <Text key={head} style={styles.tableHeader}>{head}</Text>
+              ))}
+            </View>
+            {plays.map((play, index) => (
+              <View key={`${play.clip}-${play.resultCall}-${index}`} style={styles.tableRow}>
+                <Text style={styles.cell}>{play.clip}</Text>
+                <Text style={styles.cell}>{play.downDistBucket}</Text>
+                <Text style={styles.cell}>{play.fieldZone} / {play.yardline}</Text>
+                <Text style={styles.cell}>{play.formation}</Text>
+                <Text style={styles.cell}>{play.backSet}</Text>
+                <Text style={styles.cell}>{play.playFamily}</Text>
+                <Text style={styles.cell}>{play.resultCall} / {play.playType}</Text>
+                <Text style={[styles.cell, styles.gainCell]}>{play.gain}</Text>
+              </View>
+            ))}
+          </View>
+        </ScrollView>
+      )}
+    </View>
+  );
+}
+
+function QuizEngine({ plays }) {
+  const [questionIndex, setQuestionIndex] = useState(0);
+  const [answer, setAnswer] = useState('');
+  const play = plays.length ? plays[questionIndex % plays.length] : null;
+
+  if (!play) {
+    return (
+      <View style={styles.panel}>
+        <Text style={styles.scoutPanelTitle}>DC Quiz Engine</Text>
+        <Text style={styles.emptyText}>Import or record snaps to build a defensive recognition quiz.</Text>
+      </View>
+    );
+  }
+
+  return (
+    <View style={styles.panel}>
+      <View style={styles.scoutPanelHeader}>
+        <View>
+          <Text style={styles.scoutPanelTitle}>DC Quiz Engine</Text>
+          <Text style={styles.scoutPanelSubtitle}>Identify the recorded offensive tendency from the scouting situation.</Text>
+        </View>
+        <Text style={styles.panelMeta}>Snap {questionIndex + 1} of {plays.length}</Text>
+      </View>
+      <View style={styles.quizCard}>
+        <Text style={styles.quizEyebrow}>SCOUTING SITUATION</Text>
+        <Text style={styles.quizSituation}>{play.downDistBucket} · {play.fieldZone} · {play.formation}</Text>
+        <Text style={styles.quizQuestion}>Was the recorded call a run or pass?</Text>
+        <View style={styles.quizChoices}>
+          {['RUN', 'PASS'].map((choice) => (
+            <TouchableOpacity
+              key={choice}
+              style={[
+                styles.quizChoice,
+                answer === choice && (choice === play.playType ? styles.quizChoiceCorrect : styles.quizChoiceIncorrect),
+              ]}
+              onPress={() => setAnswer(choice)}
+              accessibilityRole="button"
+              accessibilityState={{ selected: answer === choice }}
+            >
+              <Text style={styles.quizChoiceText}>{choice}</Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+        {answer ? (
+          <Text style={answer === play.playType ? styles.quizCorrectText : styles.quizIncorrectText}>
+            {answer === play.playType ? 'Correct' : `Not quite · the call was ${play.playType}`}
+            {` · ${play.playFamily}`}
+          </Text>
+        ) : null}
+        <TouchableOpacity
+          style={styles.quizNextButton}
+          onPress={() => {
+            setAnswer('');
+            setQuestionIndex((current) => (current + 1) % plays.length);
+          }}
+        >
+          <Text style={styles.quizNextText}>Next snap →</Text>
+        </TouchableOpacity>
+      </View>
+    </View>
+  );
+}
+
 export default function App() {
   const appConfig = Constants.expoConfig?.extra || {};
   const googleWebClientId = appConfig.googleWebClientId || '';
@@ -523,6 +664,17 @@ export default function App() {
   const [storageMessage, setStorageMessage] = useState('');
   const [storageMode, setStorageMode] = useState('local');
   const [storageModeMessage, setStorageModeMessage] = useState('Loading storage preference…');
+  const [teamSchedule, setTeamSchedule] = useState({
+    teams: [DEFAULT_TEAM],
+    selectedTeamId: DEFAULT_TEAM.id,
+  });
+  const [selectedTeamId, setSelectedTeamId] = useState(DEFAULT_TEAM.id);
+  const [teamDrawerVisible, setTeamDrawerVisible] = useState(false);
+  const [teamFormVisible, setTeamFormVisible] = useState(false);
+  const [teamNameInput, setTeamNameInput] = useState('');
+  const [teamWeekInput, setTeamWeekInput] = useState('');
+  const [teamScheduleMessage, setTeamScheduleMessage] = useState('');
+  const drawerTranslateX = useRef(new Animated.Value(-360)).current;
   const [cloudCsvUrl, setCloudCsvUrl] = useState('');
   const [cloudCsvUrlInput, setCloudCsvUrlInput] = useState('');
   const [settingsReady, setSettingsReady] = useState(false);
@@ -536,15 +688,6 @@ export default function App() {
   const [cloudUrlSaving, setCloudUrlSaving] = useState(false);
   const [googleIdToken, setGoogleIdToken] = useState('');
   const [googleAuthMessage, setGoogleAuthMessage] = useState('');
-  const uniqueDownDist = [
-    'ALL',
-    ...Array.from(new Set(dataset.map((p) => p.downDistBucket))).sort(compareDownDistanceBuckets),
-  ];
-  const uniqueZones = ['ALL', ...Array.from(new Set(dataset.map((p) => p.fieldZone))).sort()];
-  const uniqueFormations = ['ALL', ...Array.from(new Set(dataset.map((p) => p.formation))).sort()];
-  const uniqueBackSets = ['ALL', ...Array.from(new Set(dataset.map((p) => p.backSet))).sort()];
-  const uniqueFamilies = ['ALL', ...Array.from(new Set(dataset.map((p) => p.playFamily))).sort()];
-
   const [filters, setFilters] = useState({
     downDist: 'ALL',
     fieldZone: 'ALL',
@@ -554,13 +697,15 @@ export default function App() {
     query: '',
   });
 
-  const [modalConfig, setModalConfig] = useState(null);
   const [uploadVisible, setUploadVisible] = useState(false);
   const [uploadBusy, setUploadBusy] = useState(false);
   const [uploadError, setUploadError] = useState('');
   const [uploadPreview, setUploadPreview] = useState(null);
+  const [uploadDestinationTeamId, setUploadDestinationTeamId] = useState(selectedTeamId);
+  const [uploadWeekPickerVisible, setUploadWeekPickerVisible] = useState(false);
   const [clearConfirmVisible, setClearConfirmVisible] = useState(false);
   const [activeSection, setActiveSection] = useState('dashboard');
+  const [activeScoutTab, setActiveScoutTab] = useState('formations');
   const [recordForm, setRecordForm] = useState({
     clip: '',
     down: '1',
@@ -575,6 +720,10 @@ export default function App() {
     resultCall: '',
   });
   const [recordMessage, setRecordMessage] = useState('');
+  const selectedTeam = teamSchedule.teams.find((team) => team.id === selectedTeamId) || DEFAULT_TEAM;
+  const uploadDestinationTeam = teamSchedule.teams.find(
+    (team) => team.id === uploadDestinationTeamId,
+  ) || selectedTeam;
 
   useEffect(() => {
     if (!googleAuthResponse) return;
@@ -628,24 +777,68 @@ export default function App() {
     let active = true;
     const restoreLocalData = async () => {
       try {
-        const [savedValue, savedMode] = await Promise.all([
+        const [savedValue, savedScheduleValue, savedMode] = await Promise.all([
           AsyncStorage.getItem(LOCAL_DATA_KEY),
+          AsyncStorage.getItem(TEAM_SCHEDULE_KEY),
           AsyncStorage.getItem(STORAGE_MODE_KEY),
         ]);
         if (!active) return;
-        if (savedMode === 'cloud') {
-          setStorageMessage('Cloud mode is active. Fetching the configured CSV…');
-          return;
+
+        let restoredSchedule = null;
+        if (savedScheduleValue) {
+          try {
+            const parsedSchedule = JSON.parse(savedScheduleValue);
+            if (isStoredTeamSchedule(parsedSchedule)) {
+              restoredSchedule = parsedSchedule;
+            } else {
+              setStorageMessage('Saved team schedule is invalid. A new default schedule was created.');
+            }
+          } catch (error) {
+            setStorageMessage(`Could not read the saved team schedule: ${error.message}`);
+          }
         }
-        if (savedValue) {
-          const saved = JSON.parse(savedValue);
+
+        if (!restoredSchedule) {
+          restoredSchedule = {
+            teams: [DEFAULT_TEAM],
+            selectedTeamId: DEFAULT_TEAM.id,
+          };
+          if (savedValue) {
+            const legacyPlaybook = JSON.parse(savedValue);
+            if (isStoredPlaybook(legacyPlaybook)) {
+              await AsyncStorage.setItem(getTeamDatasetKey(DEFAULT_TEAM.id), savedValue);
+            } else {
+              setStorageMessage('Saved data could not be read. The sample dataset is loaded.');
+            }
+          }
+          await AsyncStorage.setItem(TEAM_SCHEDULE_KEY, JSON.stringify(restoredSchedule));
+        }
+
+        const restoredTeamId = restoredSchedule.selectedTeamId;
+        const restoredTeam = restoredSchedule.teams.find((team) => team.id === restoredTeamId);
+        const teamValue = await AsyncStorage.getItem(getTeamDatasetKey(restoredTeamId));
+        const localValue = teamValue || (
+          restoredTeamId === DEFAULT_TEAM.id && !savedScheduleValue ? savedValue : null
+        );
+        setTeamSchedule(restoredSchedule);
+        setSelectedTeamId(restoredTeamId);
+
+        if (localValue) {
+          const saved = JSON.parse(localValue);
           if (isStoredPlaybook(saved)) {
-            setDataset(refreshDownDistanceBuckets(saved.plays));
-            setRawRowCount(Number.isInteger(saved.rowCount) ? saved.rowCount : saved.plays.length);
+            const plays = refreshDownDistanceBuckets(saved.plays);
+            setDataset(plays);
+            setRawRowCount(Number.isInteger(saved.rowCount) ? saved.rowCount : plays.length);
             setDatasetName(typeof saved.name === 'string' ? saved.name : 'Saved dataset');
           } else {
-            setStorageMessage('Saved data could not be read. The sample dataset is loaded.');
+            setStorageMessage('Saved team data could not be read. The sample dataset is loaded.');
           }
+        } else if (savedScheduleValue) {
+          setDataset([]);
+          setRawRowCount(0);
+          setDatasetName(`${restoredTeam.name} playbook`);
+        } else if (savedMode === 'cloud') {
+          setStorageMessage('Cloud mode is active. Fetching the configured CSV…');
         }
       } catch (error) {
         if (active) setStorageMessage(`Could not load saved data: ${error.message}`);
@@ -722,18 +915,23 @@ export default function App() {
     return () => {
       active = false;
     };
-  }, [cloudCsvUrl, cloudRefreshKey, gridironCloudApiUrl, googleIdToken, settingsReady, storageMode]);
+  }, [cloudCsvUrl, cloudRefreshKey, gridironCloudApiUrl, googleIdToken, selectedTeamId, settingsReady, storageMode]);
 
   useEffect(() => {
     if (!storageReady || storageMode !== 'local') return undefined;
     let active = true;
     const persistLocalData = async () => {
+      const playbook = {
+        plays: dataset,
+        rowCount: rawRowCount,
+        name: datasetName,
+      };
       try {
-        await AsyncStorage.setItem(LOCAL_DATA_KEY, JSON.stringify({
-          plays: dataset,
-          rowCount: rawRowCount,
-          name: datasetName,
-        }));
+        const serialized = JSON.stringify(playbook);
+        await Promise.all([
+          AsyncStorage.setItem(getTeamDatasetKey(selectedTeamId), serialized),
+          AsyncStorage.setItem(LOCAL_DATA_KEY, serialized),
+        ]);
         if (active) setStorageMessage('Saved locally on this device');
       } catch (error) {
         if (active) setStorageMessage(`Could not save data locally: ${error.message}`);
@@ -743,7 +941,119 @@ export default function App() {
     return () => {
       active = false;
     };
-  }, [dataset, datasetName, rawRowCount, storageMode, storageReady]);
+  }, [dataset, datasetName, rawRowCount, selectedTeamId, storageMode, storageReady]);
+
+  useEffect(() => {
+    if (!teamDrawerVisible) return undefined;
+    drawerTranslateX.setValue(-360);
+    Animated.timing(drawerTranslateX, {
+      toValue: 0,
+      duration: 220,
+      useNativeDriver: Platform.OS !== 'web',
+    }).start();
+    return undefined;
+  }, [drawerTranslateX, teamDrawerVisible]);
+
+  const closeTeamDrawer = () => setTeamDrawerVisible(false);
+
+  const saveCurrentTeamData = async () => {
+    if (storageMode !== 'local') return;
+    const serialized = JSON.stringify({
+      plays: dataset,
+      rowCount: rawRowCount,
+      name: datasetName,
+    });
+    await Promise.all([
+      AsyncStorage.setItem(getTeamDatasetKey(selectedTeamId), serialized),
+      AsyncStorage.setItem(LOCAL_DATA_KEY, serialized),
+    ]);
+  };
+
+  const selectScheduleTeam = async (teamId) => {
+    const nextTeam = teamSchedule.teams.find((team) => team.id === teamId);
+    if (!nextTeam) {
+      setTeamScheduleMessage('That schedule entry could not be found.');
+      return;
+    }
+    if (teamId === selectedTeamId) {
+      closeTeamDrawer();
+      return;
+    }
+
+    try {
+      await saveCurrentTeamData();
+      let nextPlaybook = { plays: [], rowCount: 0, name: `${nextTeam.name} playbook` };
+      if (storageMode === 'local') {
+        const savedValue = await AsyncStorage.getItem(getTeamDatasetKey(teamId));
+        if (savedValue) {
+          const saved = JSON.parse(savedValue);
+          if (!isStoredPlaybook(saved)) {
+            throw new Error(`Saved play data for ${nextTeam.name} is invalid.`);
+          }
+          nextPlaybook = saved;
+        }
+      }
+      const nextSchedule = { ...teamSchedule, selectedTeamId: teamId };
+      await AsyncStorage.setItem(TEAM_SCHEDULE_KEY, JSON.stringify(nextSchedule));
+      setTeamSchedule(nextSchedule);
+      setSelectedTeamId(teamId);
+      setDataset(refreshDownDistanceBuckets(nextPlaybook.plays));
+      setRawRowCount(Number.isInteger(nextPlaybook.rowCount)
+        ? nextPlaybook.rowCount
+        : nextPlaybook.plays.length);
+      setDatasetName(typeof nextPlaybook.name === 'string'
+        ? nextPlaybook.name
+        : `${nextTeam.name} playbook`);
+      resetFilters();
+      setTeamScheduleMessage('');
+      closeTeamDrawer();
+    } catch (error) {
+      setTeamScheduleMessage(`Could not switch schedule entries: ${error.message}`);
+    }
+  };
+
+  const addScheduleTeam = async () => {
+    const name = teamNameInput.trim();
+    if (!name) {
+      setTeamScheduleMessage('Enter a team or opponent name to add it to the schedule.');
+      return;
+    }
+
+    const team = createTeamScheduleEntry(name, teamWeekInput);
+    const nextSchedule = {
+      teams: [...teamSchedule.teams, team],
+      selectedTeamId: team.id,
+    };
+    const emptyPlaybook = JSON.stringify({
+      plays: [],
+      rowCount: 0,
+      name: `${team.name} playbook`,
+    });
+
+    try {
+      await saveCurrentTeamData();
+      await AsyncStorage.setItem(getTeamDatasetKey(team.id), emptyPlaybook);
+      await AsyncStorage.setItem(TEAM_SCHEDULE_KEY, JSON.stringify(nextSchedule));
+      setTeamSchedule(nextSchedule);
+      setSelectedTeamId(team.id);
+      setDataset([]);
+      setRawRowCount(0);
+      setDatasetName(`${team.name} playbook`);
+      resetFilters();
+      setTeamNameInput('');
+      setTeamWeekInput('');
+      setTeamFormVisible(false);
+      setTeamScheduleMessage(`${team.name} added to your schedule.`);
+    } catch (error) {
+      setTeamScheduleMessage(`Could not save the schedule entry: ${error.message}`);
+    }
+  };
+
+  const navigateFromDrawer = (section) => {
+    setActiveSection(section);
+    if (section === 'record') setRecordMessage('');
+    closeTeamDrawer();
+  };
 
   const chooseCsvFile = async () => {
     setUploadError('');
@@ -790,15 +1100,49 @@ export default function App() {
     }
   };
 
-  const useImportedDataset = () => {
+  const useImportedDataset = async () => {
     if (!uploadPreview?.plays.length) return;
-    setDataset(uploadPreview.plays);
-    setRawRowCount(uploadPreview.rowCount);
-    setDatasetName(uploadPreview.name);
-    setFilters({ downDist: 'ALL', fieldZone: 'ALL', formation: 'ALL', backSet: 'ALL', playFamily: 'ALL', query: '' });
-    setUploadVisible(false);
-    setUploadPreview(null);
+    const destinationTeam = teamSchedule.teams.find(
+      (team) => team.id === uploadDestinationTeamId,
+    );
+    if (!destinationTeam) {
+      setUploadError('That schedule week is no longer available. Close the upload screen and try again.');
+      return;
+    }
+    const playbook = {
+      plays: uploadPreview.plays,
+      rowCount: uploadPreview.rowCount,
+      name: uploadPreview.name,
+    };
+    const destination = `${destinationTeam.name}${destinationTeam.week ? ` (Week ${destinationTeam.week})` : ''}`;
+    const nextSchedule = { ...teamSchedule, selectedTeamId: destinationTeam.id };
+    setUploadBusy(true);
     setUploadError('');
+    try {
+      const serialized = JSON.stringify(playbook);
+      await Promise.all([
+        AsyncStorage.setItem(getTeamDatasetKey(destinationTeam.id), serialized),
+        AsyncStorage.setItem(LOCAL_DATA_KEY, serialized),
+        AsyncStorage.setItem(STORAGE_MODE_KEY, 'local'),
+        AsyncStorage.setItem(TEAM_SCHEDULE_KEY, JSON.stringify(nextSchedule)),
+      ]);
+      setTeamSchedule(nextSchedule);
+      setSelectedTeamId(destinationTeam.id);
+      setDataset(uploadPreview.plays);
+      setRawRowCount(uploadPreview.rowCount);
+      setDatasetName(uploadPreview.name);
+      setFilters({ downDist: 'ALL', fieldZone: 'ALL', formation: 'ALL', backSet: 'ALL', playFamily: 'ALL', query: '' });
+      setStorageMode('local');
+      setCloudLoading(false);
+      setStorageMessage('Saved locally on this device');
+      setStorageModeMessage(`Imported ${compactNumber(uploadPreview.plays.length)} plays to ${destination}. Local mode selected.`);
+      setUploadVisible(false);
+      setUploadPreview(null);
+    } catch (error) {
+      setUploadError(`Could not save the CSV to ${destination}: ${error.message}`);
+    } finally {
+      setUploadBusy(false);
+    }
   };
 
   const loadSampleDataset = () => {
@@ -877,23 +1221,15 @@ export default function App() {
   const totalPlays = filteredPlays.length;
   const runCount = filteredPlays.filter((p) => p.playType === 'RUN').length;
   const passCount = filteredPlays.filter((p) => p.playType === 'PASS').length;
-  const avgGain = totalPlays ? (filteredPlays.reduce((sum, p) => sum + p.gain, 0) / totalPlays).toFixed(1) : '0.0';
-
-  const formationCounts = filteredPlays.reduce((map, play) => {
-    map[play.formation] = (map[play.formation] || 0) + 1;
-    return map;
-  }, {});
-
-  const topFormation = Object.entries(formationCounts).sort((a, b) => b[1] - a[1])[0];
-
-  const familyCounts = filteredPlays.reduce((map, play) => {
-    map[play.playFamily] = (map[play.playFamily] || 0) + 1;
-    return map;
-  }, {});
-
-  const topFamily = Object.entries(familyCounts).sort((a, b) => b[1] - a[1])[0];
-
-  const resetFilters = () => setFilters({ downDist: 'ALL', fieldZone: 'ALL', formation: 'ALL', backSet: 'ALL', playFamily: 'ALL', query: '' });
+  const activeScoutTabConfig = SCOUT_TABS.find((tab) => tab.id === activeScoutTab) || SCOUT_TABS[2];
+  const resetFilters = () => setFilters({
+    downDist: 'ALL',
+    fieldZone: 'ALL',
+    formation: 'ALL',
+    backSet: 'ALL',
+    playFamily: 'ALL',
+    query: '',
+  });
 
   const selectStorageMode = async (mode) => {
     if (mode === 'cloud' && !cloudCsvUrl.trim()) {
@@ -906,7 +1242,8 @@ export default function App() {
     try {
       let localPlaybook = null;
       if (mode === 'local') {
-        const savedValue = await AsyncStorage.getItem(LOCAL_DATA_KEY);
+        const savedValue = await AsyncStorage.getItem(getTeamDatasetKey(selectedTeamId))
+          || (selectedTeamId === DEFAULT_TEAM.id ? await AsyncStorage.getItem(LOCAL_DATA_KEY) : null);
         if (savedValue) {
           const saved = JSON.parse(savedValue);
           if (isStoredPlaybook(saved)) {
@@ -926,12 +1263,18 @@ export default function App() {
         setDatasetName(typeof localPlaybook.name === 'string' ? localPlaybook.name : 'Saved dataset');
         setFilters({ downDist: 'ALL', fieldZone: 'ALL', formation: 'ALL', backSet: 'ALL', playFamily: 'ALL', query: '' });
         setStorageModeMessage('Local mode selected. Saved play data loaded from this device.');
-      } else {
+      } else if (selectedTeamId === DEFAULT_TEAM.id) {
         setDataset(sampleData.plays);
         setRawRowCount(sampleData.rowCount);
         setDatasetName('Sample dataset');
         setFilters({ downDist: 'ALL', fieldZone: 'ALL', formation: 'ALL', backSet: 'ALL', playFamily: 'ALL', query: '' });
         setStorageModeMessage('Local mode selected. Sample play data loaded; no local playbook was saved yet.');
+      } else {
+        setDataset([]);
+        setRawRowCount(0);
+        setDatasetName(`${selectedTeam.name} playbook`);
+        setFilters({ downDist: 'ALL', fieldZone: 'ALL', formation: 'ALL', backSet: 'ALL', playFamily: 'ALL', query: '' });
+        setStorageModeMessage('Local mode selected. This schedule entry has no saved play data yet.');
       }
       if (mode === 'local') setCloudLoading(false);
     } catch (error) {
@@ -1046,14 +1389,32 @@ export default function App() {
       <StatusBar barStyle="light-content" />
       <View style={styles.header}>
         <View style={styles.headerLeft}>
+          <TouchableOpacity
+            style={styles.menuButton}
+            onPress={() => setTeamDrawerVisible(true)}
+            accessibilityRole="button"
+            accessibilityLabel="Open team menu"
+          >
+            <Text style={styles.menuButtonText}>☰</Text>
+          </TouchableOpacity>
           <View style={styles.logo}><Text style={styles.logoText}>◎</Text></View>
           <View>
             <Text style={styles.headerTitle}>Gridiron Scout</Text>
-            <Text style={styles.headerSubtitle}>Tendency Engine</Text>
+            <Text style={styles.headerSubtitle}>
+              {selectedTeam.name}{selectedTeam.week ? ` · Week ${selectedTeam.week}` : ''}
+            </Text>
           </View>
         </View>
         <View style={styles.headerButtons}>
-          <TouchableOpacity style={styles.actionButton} onPress={() => { setUploadError(''); setUploadVisible(true); }}>
+          <TouchableOpacity
+            style={styles.actionButton}
+            onPress={() => {
+              setUploadError('');
+              setUploadDestinationTeamId(selectedTeamId);
+              setUploadWeekPickerVisible(false);
+              setUploadVisible(true);
+            }}
+          >
             <Text style={styles.actionText}>Import CSV</Text>
           </TouchableOpacity>
           <TouchableOpacity style={styles.primaryButton} onPress={loadSampleDataset}>
@@ -1071,115 +1432,93 @@ export default function App() {
         </View>
       </View>
 
-      <View style={styles.navigation}>
-        <TouchableOpacity
-          style={[styles.navItem, activeSection === 'dashboard' && styles.navItemActive]}
-          onPress={() => setActiveSection('dashboard')}
-          accessibilityRole="button"
-          accessibilityState={{ selected: activeSection === 'dashboard' }}
+      {activeSection === 'dashboard' && (
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          style={styles.scoutTabBar}
+          contentContainerStyle={styles.scoutTabList}
         >
-          <Text style={[styles.navItemText, activeSection === 'dashboard' && styles.navItemTextActive]}>Dashboard</Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          style={[styles.navItem, activeSection === 'record' && styles.navItemActive]}
-          onPress={() => { setActiveSection('record'); setRecordMessage(''); }}
-          accessibilityRole="button"
-          accessibilityState={{ selected: activeSection === 'record' }}
-        >
-          <Text style={[styles.navItemText, activeSection === 'record' && styles.navItemTextActive]}>Record Data</Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          style={[styles.navItem, activeSection === 'settings' && styles.navItemActive]}
-          onPress={() => setActiveSection('settings')}
-          accessibilityRole="button"
-          accessibilityState={{ selected: activeSection === 'settings' }}
-        >
-          <Text style={[styles.navItemText, activeSection === 'settings' && styles.navItemTextActive]}>Settings</Text>
-        </TouchableOpacity>
-      </View>
+          {SCOUT_TABS.map((tab) => {
+            const selected = activeScoutTab === tab.id;
+            return (
+              <TouchableOpacity
+                key={tab.id}
+                style={[styles.scoutTab, selected && styles.scoutTabActive]}
+                onPress={() => setActiveScoutTab(tab.id)}
+                accessibilityRole="tab"
+                accessibilityLabel={tab.label}
+                accessibilityState={{ selected }}
+              >
+                <Text style={[styles.scoutTabIcon, { color: tab.accent }]}>{tab.icon}</Text>
+                <Text style={[styles.scoutTabText, selected && styles.scoutTabTextActive]}>
+                  {tab.label}
+                </Text>
+              </TouchableOpacity>
+            );
+          })}
+        </ScrollView>
+      )}
 
       {activeSection === 'dashboard' ? (
-      <ScrollView contentContainerStyle={styles.content}>
-        <View style={styles.statsGrid}>
-          <StatCard label="Total Clips Ingested" value={compactNumber(rawRowCount)} sublabel={datasetName} accent={theme.text} />
-          <StatCard label="Valid Scout Snaps" value={compactNumber(dataset.length)} sublabel="Penalties & blanks excluded" accent={theme.emerald} />
-          <StatCard label="Run / Pass Ratio" value={`${runCount} / ${passCount}`} sublabel="Overall balance" accent={theme.cyan} />
-          <StatCard label="Avg Gain / Play" value={`${avgGain} yds`} sublabel="Filtered clips" accent={theme.amber} />
-          <StatCard label="Top Formation" value={topFormation ? topFormation[0] : '-'} sublabel={topFormation ? `${formatPct(topFormation[1], totalPlays)} frequency` : '0% frequency'} accent={theme.indigo} />
-          <StatCard label="Top Play Family" value={topFamily ? topFamily[0] : '-'} sublabel={topFamily ? `${formatPct(topFamily[1], totalPlays)} frequency` : '0% frequency'} accent={theme.rose} />
+      <ScrollView contentContainerStyle={styles.scoutContent}>
+        <View style={styles.scoutSummary}>
+          <View style={styles.scoutTeamSummary}>
+            <View style={styles.statusDot} />
+            <Text style={styles.scoutSummaryLabel}>Scouting opponent:</Text>
+            <Text style={styles.scoutTeamName}>
+              {selectedTeam.name}{selectedTeam.week ? ` · Week ${selectedTeam.week}` : ''}
+            </Text>
+          </View>
+          <View style={styles.scoutMetrics}>
+            <Text style={styles.scoutMetric}><Text style={styles.metricHighlight}>{compactNumber(totalPlays)}</Text> Snaps</Text>
+            <Text style={styles.scoutMetric}>Run Rate: <Text style={styles.runMetric}>{formatPct(runCount, totalPlays)}</Text></Text>
+            <Text style={styles.scoutMetric}>Pass Rate: <Text style={styles.passMetric}>{formatPct(passCount, totalPlays)}</Text></Text>
+            <Text style={styles.scoutMetric}>Displaying {compactNumber(totalPlays)} matching plays</Text>
+          </View>
         </View>
 
-        <View style={styles.filterPanel}>
+        <View style={styles.scoutToolbar}>
           <Text style={styles.storageMessage}>
             {storageMode === 'cloud' ? cloudLoadMessage : storageMessage || 'Saving data locally…'}
           </Text>
-          <View style={styles.filterHeader}>
-            <Text style={styles.filterTitle}>Hierarchical Drilldown Filters</Text>
-            <TouchableOpacity onPress={resetFilters}>
-              <Text style={styles.resetText}>Reset All</Text>
-            </TouchableOpacity>
+          <View style={styles.scoutSearch}>
+            <Text style={styles.searchPlaceholder}>⌕</Text>
+            <TextInput
+              value={filters.query}
+              onChangeText={(text) => setFilters((previous) => ({ ...previous, query: text }))}
+              placeholder="Search scouting data..."
+              placeholderTextColor={theme.muted}
+              style={styles.searchInput}
+              accessibilityLabel="Search scouting data"
+            />
           </View>
-
-          <View style={styles.searchRow}>
-            <View style={styles.searchContainer}>
-              <Text style={styles.searchPlaceholder}>⌕</Text>
-              <TextInput
-                value={filters.query}
-                onChangeText={(text) => setFilters((prev) => ({ ...prev, query: text }))}
-                placeholder="Search play, tag, call..."
-                placeholderTextColor={theme.muted}
-                style={styles.searchInput}
-              />
-            </View>
-          </View>
-
-          <Text style={styles.downDistanceHint}>
-            Short (S): 1–3 yds · Medium (M): 4–6 yds · Long (L): 7+ yds
-          </Text>
-          <View style={styles.filtersGrid}>
-            <FilterSelect label="1. Down & Distance" value={filters.downDist === 'ALL' ? 'All Downs & Distances' : filters.downDist} options={uniqueDownDist} onPress={() => setModalConfig({ title: 'Down & Distance', options: uniqueDownDist, selectedValue: filters.downDist, keyName: 'downDist', onSelect: (value) => setFilters((prev) => ({ ...prev, downDist: value })) })} />
-            <FilterSelect label="2. Field Zone" value={filters.fieldZone === 'ALL' ? 'All Field Zones' : filters.fieldZone} options={uniqueZones} onPress={() => setModalConfig({ title: 'Field Zone', options: uniqueZones, selectedValue: filters.fieldZone, keyName: 'fieldZone', onSelect: (value) => setFilters((prev) => ({ ...prev, fieldZone: value })) })} />
-            <FilterSelect label="3. Formation" value={filters.formation === 'ALL' ? 'All Formations' : filters.formation} options={uniqueFormations} onPress={() => setModalConfig({ title: 'Formation', options: uniqueFormations, selectedValue: filters.formation, keyName: 'formation', onSelect: (value) => setFilters((prev) => ({ ...prev, formation: value })) })} />
-            <FilterSelect label="4. Back Set" value={filters.backSet === 'ALL' ? 'All Back Sets' : filters.backSet} options={uniqueBackSets} onPress={() => setModalConfig({ title: 'Back Set', options: uniqueBackSets, selectedValue: filters.backSet, keyName: 'backSet', onSelect: (value) => setFilters((prev) => ({ ...prev, backSet: value })) })} />
-            <FilterSelect label="5. Play Family" value={filters.playFamily === 'ALL' ? 'All Play Families' : filters.playFamily} options={uniqueFamilies} onPress={() => setModalConfig({ title: 'Play Family', options: uniqueFamilies, selectedValue: filters.playFamily, keyName: 'playFamily', onSelect: (value) => setFilters((prev) => ({ ...prev, playFamily: value })) })} />
-          </View>
+          <Text style={styles.scoutDatasetName}>{datasetName} · {compactNumber(rawRowCount)} rows</Text>
         </View>
 
-        <View style={styles.panel}>
-          <View style={styles.panelHeader}>
-            <Text style={styles.panelTitle}>Tendency Tree</Text>
-            <Text style={styles.panelMeta}>Displaying {compactNumber(totalPlays)} matching plays</Text>
-          </View>
-          <HierarchyTree plays={filteredPlays} />
-        </View>
-
-        <View style={styles.panel}>
-          <View style={styles.panelHeader}>
-            <Text style={styles.panelTitle}>Flat Analytics View</Text>
-            <Text style={styles.panelMeta}>Filtered results</Text>
-          </View>
-          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.tableWrap}>
-            <View style={styles.table}>
-              <View style={styles.tableHeaderRow}>
-                {['Clip #', 'Down & Dist', 'Field Zone / Yardline', 'Formation', 'Back Set', 'Play Family', 'Result / Type', 'Gain'].map((head) => (
-                  <Text key={head} style={styles.tableHeader}>{head}</Text>
-                ))}
+        {activeScoutTabConfig.field ? (
+          <TendencyCards
+            plays={filteredPlays}
+            field={activeScoutTabConfig.field}
+            title={activeScoutTabConfig.label}
+            accent={activeScoutTabConfig.accent}
+          />
+        ) : activeScoutTab === 'quiz' ? (
+          <QuizEngine plays={filteredPlays} />
+        ) : activeScoutTab === 'call-sheet' ? (
+          <View style={styles.panel}>
+            <View style={styles.scoutPanelHeader}>
+              <View>
+                <Text style={styles.scoutPanelTitle}>Beebe Call Sheet</Text>
+                <Text style={styles.scoutPanelSubtitle}>Down-and-distance tendencies, grouped into a quick sideline reference.</Text>
               </View>
-              {filteredPlays.map((play) => (
-                <View key={`${play.clip}-${play.resultCall}`} style={styles.tableRow}>
-                  <Text style={styles.cell}>{play.clip}</Text>
-                  <Text style={styles.cell}>{play.downDistBucket}</Text>
-                  <Text style={styles.cell}>{play.fieldZone} / {play.yardline}</Text>
-                  <Text style={styles.cell}>{play.formation}</Text>
-                  <Text style={styles.cell}>{play.backSet}</Text>
-                  <Text style={styles.cell}>{play.playFamily}</Text>
-                  <Text style={styles.cell}>{play.resultCall} / {play.playType}</Text>
-                  <Text style={[styles.cell, styles.gainCell]}>{play.gain}</Text>
-                </View>
-              ))}
+              <Text style={styles.panelMeta}>{compactNumber(filteredPlays.length)} snaps</Text>
             </View>
-          </ScrollView>
-        </View>
+            <HierarchyTree plays={filteredPlays} />
+          </View>
+        ) : (
+          <SnapLog plays={filteredPlays} />
+        )}
       </ScrollView>
       ) : activeSection === 'record' ? (
         <ScrollView contentContainerStyle={styles.recordScreenContent} keyboardShouldPersistTaps="handled">
@@ -1453,17 +1792,152 @@ export default function App() {
         </ScrollView>
       )}
 
-      <DropdownModal
-        visible={Boolean(modalConfig)}
-        title={modalConfig?.title ?? ''}
-        options={modalConfig?.options ?? []}
-        selectedValue={modalConfig?.selectedValue ?? 'ALL'}
-        onClose={() => setModalConfig(null)}
-        onSelect={(value) => {
-          modalConfig?.onSelect(value);
-          setModalConfig(null);
-        }}
-      />
+      <Modal
+        visible={teamDrawerVisible}
+        transparent
+        animationType="none"
+        onRequestClose={closeTeamDrawer}
+      >
+        <View style={styles.teamDrawerOverlay}>
+          <Pressable
+            style={styles.teamDrawerBackdrop}
+            onPress={closeTeamDrawer}
+            accessibilityRole="button"
+            accessibilityLabel="Close team menu"
+          />
+          <Animated.View
+            style={[styles.teamDrawer, { transform: [{ translateX: drawerTranslateX }] }]}
+            onStartShouldSetResponder={() => true}
+          >
+            <SafeAreaView style={styles.teamDrawerSafeArea}>
+              <View style={styles.teamDrawerHeader}>
+                <View>
+                  <Text style={styles.teamDrawerTitle}>Team schedule</Text>
+                  <Text style={styles.teamDrawerSubtitle}>Select a saved scouting entry</Text>
+                </View>
+                <TouchableOpacity
+                  onPress={closeTeamDrawer}
+                  accessibilityRole="button"
+                  accessibilityLabel="Close team menu"
+                  style={styles.teamDrawerClose}
+                >
+                  <Text style={styles.teamDrawerCloseText}>×</Text>
+                </TouchableOpacity>
+              </View>
+
+              <ScrollView contentContainerStyle={styles.teamDrawerContent} keyboardShouldPersistTaps="handled">
+                <Text style={styles.drawerSectionLabel}>NAVIGATION</Text>
+                {[
+                  { id: 'dashboard', label: 'Dashboard' },
+                  { id: 'record', label: 'Record Data' },
+                  { id: 'settings', label: 'Settings' },
+                ].map((section) => (
+                  <TouchableOpacity
+                    key={section.id}
+                    style={[styles.drawerNavItem, activeSection === section.id && styles.drawerNavItemActive]}
+                    onPress={() => navigateFromDrawer(section.id)}
+                    accessibilityRole="button"
+                    accessibilityState={{ selected: activeSection === section.id }}
+                  >
+                    <Text style={[styles.drawerNavText, activeSection === section.id && styles.drawerNavTextActive]}>
+                      {section.label}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+
+                <View style={styles.drawerSectionHeader}>
+                  <Text style={styles.drawerSectionLabel}>SCHEDULE</Text>
+                  <Text style={styles.drawerScheduleCount}>{teamSchedule.teams.length}</Text>
+                </View>
+                <Text style={styles.teamDrawerHint}>
+                  Each entry keeps its own playbook on this device. Cloud mode continues to use the configured shared CSV.
+                </Text>
+                {teamSchedule.teams.map((team) => {
+                  const isSelected = team.id === selectedTeamId;
+                  return (
+                    <TouchableOpacity
+                      key={team.id}
+                      style={[styles.scheduleEntry, isSelected && styles.scheduleEntryActive]}
+                      onPress={() => selectScheduleTeam(team.id)}
+                      accessibilityRole="button"
+                      accessibilityLabel={`Select schedule entry ${team.name}`}
+                      accessibilityState={{ selected: isSelected }}
+                    >
+                      <View style={styles.scheduleEntryText}>
+                        <Text style={[styles.scheduleEntryName, isSelected && styles.scheduleEntryNameActive]}>
+                          {team.name}
+                        </Text>
+                        <Text style={styles.scheduleEntryWeek}>
+                          {team.week ? `Week ${team.week}` : 'Schedule entry'}
+                        </Text>
+                      </View>
+                      {isSelected && <Text style={styles.scheduleEntryCheck}>✓</Text>}
+                    </TouchableOpacity>
+                  );
+                })}
+
+                {!teamFormVisible ? (
+                  <TouchableOpacity
+                    style={styles.addScheduleButton}
+                    onPress={() => {
+                      setTeamScheduleMessage('');
+                      setTeamFormVisible(true);
+                    }}
+                    accessibilityRole="button"
+                    accessibilityLabel="Add schedule entry"
+                  >
+                    <Text style={styles.addScheduleText}>＋  Add schedule entry</Text>
+                  </TouchableOpacity>
+                ) : (
+                  <View style={styles.teamForm}>
+                    <Text style={styles.teamFormTitle}>New schedule entry</Text>
+                    <TextInput
+                      value={teamNameInput}
+                      onChangeText={setTeamNameInput}
+                      placeholder="e.g. Northside Hawks"
+                      placeholderTextColor={theme.muted}
+                      style={styles.recordInput}
+                      accessibilityLabel="Team or opponent name"
+                    />
+                    <TextInput
+                      value={teamWeekInput}
+                      onChangeText={setTeamWeekInput}
+                      placeholder="Week (optional)"
+                      placeholderTextColor={theme.muted}
+                      style={styles.recordInput}
+                      accessibilityLabel="Schedule week (optional)"
+                    />
+                    <View style={styles.teamFormActions}>
+                      <TouchableOpacity
+                        style={styles.cancelButton}
+                        onPress={() => {
+                          setTeamFormVisible(false);
+                          setTeamScheduleMessage('');
+                        }}
+                        accessibilityRole="button"
+                      >
+                        <Text style={styles.cancelButtonText}>Cancel</Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        style={[styles.recordSubmitButton, styles.teamFormSaveButton]}
+                        onPress={addScheduleTeam}
+                        accessibilityRole="button"
+                      >
+                        <Text style={styles.recordSubmitText}>Save schedule entry</Text>
+                      </TouchableOpacity>
+                    </View>
+                  </View>
+                )}
+                {!!teamScheduleMessage && (
+                  <Text style={styles.teamScheduleMessage} accessibilityLiveRegion="polite">
+                    {teamScheduleMessage}
+                  </Text>
+                )}
+              </ScrollView>
+            </SafeAreaView>
+          </Animated.View>
+        </View>
+      </Modal>
       <Modal
         visible={clearConfirmVisible}
         transparent
@@ -1548,8 +2022,22 @@ export default function App() {
             <View style={styles.uploadHero}>
               <View style={styles.uploadIcon}><Text style={styles.uploadIconText}>↑</Text></View>
               <Text style={styles.uploadHeading}>Bring your scouting data</Text>
+              <Text style={styles.recordFieldLabel}>Schedule week</Text>
+              <TouchableOpacity
+                style={styles.uploadWeekButton}
+                onPress={() => setUploadWeekPickerVisible(true)}
+                accessibilityRole="button"
+                accessibilityLabel={`Select upload week, currently ${uploadDestinationTeam.week ? `Week ${uploadDestinationTeam.week}` : 'no week'}, ${uploadDestinationTeam.name}`}
+              >
+                <Text style={styles.uploadWeekValue}>
+                  {uploadDestinationTeam.week
+                    ? `Week ${uploadDestinationTeam.week} · ${uploadDestinationTeam.name}`
+                    : `No week · ${uploadDestinationTeam.name}`}
+                </Text>
+                <Text style={styles.filterChevron}>▾</Text>
+              </TouchableOpacity>
               <Text style={styles.uploadDescription}>
-                Choose a CSV from your device. Your imported playbook replaces the current view and is saved locally on this device.
+                The CSV replaces this schedule entry’s playbook and is saved locally. Importing selects this week and Local mode.
               </Text>
               <TouchableOpacity style={styles.pickFileButton} onPress={chooseCsvFile} disabled={uploadBusy}>
                 <Text style={styles.pickFileText}>{uploadBusy ? 'Reading CSV…' : 'Choose CSV file'}</Text>
@@ -1594,13 +2082,61 @@ export default function App() {
                     <Text style={styles.previewMore}>and {uploadPreview.plays.length - 4} more plays</Text>
                   )}
                 </View>
-                <TouchableOpacity style={styles.pickFileButton} onPress={useImportedDataset}>
-                  <Text style={styles.pickFileText}>Use this dataset</Text>
+                <TouchableOpacity
+                  style={[styles.pickFileButton, uploadBusy && styles.settingsButtonDisabled]}
+                  onPress={useImportedDataset}
+                  disabled={uploadBusy}
+                  accessibilityRole="button"
+                >
+                  <Text style={styles.pickFileText}>{uploadBusy ? 'Saving to schedule…' : 'Import to this week'}</Text>
                 </TouchableOpacity>
               </View>
             )}
           </ScrollView>
         </SafeAreaView>
+      </Modal>
+      <Modal
+        visible={uploadWeekPickerVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setUploadWeekPickerVisible(false)}
+      >
+        <Pressable
+          style={styles.modalOverlay}
+          onPress={() => setUploadWeekPickerVisible(false)}
+        >
+          <Pressable style={styles.modalCard} onPress={() => {}}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Select schedule week</Text>
+              <TouchableOpacity onPress={() => setUploadWeekPickerVisible(false)}>
+                <Text style={styles.closeText}>Close</Text>
+              </TouchableOpacity>
+            </View>
+            <ScrollView style={styles.modalList}>
+              {teamSchedule.teams.map((team) => (
+                <TouchableOpacity
+                  key={team.id}
+                  style={[
+                    styles.modalItem,
+                    uploadDestinationTeamId === team.id && styles.modalItemActive,
+                  ]}
+                  onPress={() => {
+                    setUploadDestinationTeamId(team.id);
+                    setUploadWeekPickerVisible(false);
+                    setUploadError('');
+                  }}
+                  accessibilityRole="button"
+                  accessibilityState={{ selected: uploadDestinationTeamId === team.id }}
+                  accessibilityLabel={`Choose ${team.week ? `Week ${team.week}` : 'no week'}, ${team.name}`}
+                >
+                  <Text style={styles.modalItemText}>
+                    {team.week ? `Week ${team.week}` : 'No week'} · {team.name}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </ScrollView>
+          </Pressable>
+        </Pressable>
       </Modal>
     </SafeAreaView>
   );
@@ -1612,15 +2148,26 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    backgroundColor: '#0f172a',
+    backgroundColor: '#060b16',
     borderBottomWidth: 1,
     borderBottomColor: theme.border,
-    paddingHorizontal: 18,
-    paddingVertical: 14,
+    paddingHorizontal: 20,
+    paddingVertical: 8,
   },
   cloudUrlPromptInput: { marginTop: 14 },
   cloudUrlSaveButton: { flex: 1 },
-  headerLeft: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  headerLeft: { flexDirection: 'row', alignItems: 'center', gap: 10, flexShrink: 1 },
+  menuButton: {
+    width: 36,
+    height: 36,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 10,
+    backgroundColor: theme.bg,
+    borderWidth: 1,
+    borderColor: '#334155',
+  },
+  menuButtonText: { color: theme.emerald, fontSize: 18, fontWeight: '700' },
   logo: {
     width: 36,
     height: 36,
@@ -1632,7 +2179,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   logoText: { color: theme.emerald, fontSize: 18 },
-  headerTitle: { color: theme.white, fontSize: 18, fontWeight: '700' },
+  headerTitle: { color: theme.white, fontSize: 16, fontWeight: '800' },
   headerSubtitle: { color: theme.muted, fontSize: 11 },
   headerButtons: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'flex-end', gap: 8, alignItems: 'center' },
   actionButton: {
@@ -1662,19 +2209,209 @@ const styles = StyleSheet.create({
   clearDataButtonDisabled: { opacity: 0.45 },
   clearDataText: { color: '#fca5a5', fontSize: 12, fontWeight: '700' },
   clearDataTextDisabled: { color: '#94a3b8' },
-  navigation: {
-    flexDirection: 'row',
-    gap: 8,
-    paddingHorizontal: 16,
-    paddingVertical: 9,
-    backgroundColor: '#0b1220',
+  scoutTabBar: {
+    flexGrow: 0,
+    backgroundColor: '#030817',
     borderBottomWidth: 1,
     borderBottomColor: theme.border,
   },
-  navItem: { paddingHorizontal: 14, paddingVertical: 9, borderRadius: 9 },
-  navItemActive: { backgroundColor: 'rgba(52, 211, 153, 0.14)' },
-  navItemText: { color: theme.muted, fontSize: 12, fontWeight: '700' },
-  navItemTextActive: { color: theme.emerald },
+  scoutTabList: { minWidth: '100%', paddingHorizontal: 18 },
+  scoutTab: {
+    minHeight: 38,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 7,
+    paddingHorizontal: 13,
+    borderBottomWidth: 2,
+    borderBottomColor: 'transparent',
+  },
+  scoutTabActive: { borderBottomColor: theme.amber, backgroundColor: 'rgba(148, 163, 184, 0.08)' },
+  scoutTabIcon: { fontSize: 13, fontWeight: '900' },
+  scoutTabText: { color: '#aab8cc', fontSize: 11, fontWeight: '700' },
+  scoutTabTextActive: { color: theme.white },
+  scoutContent: { padding: 20, gap: 16, width: '100%', maxWidth: 1500, alignSelf: 'center' },
+  scoutSummary: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+    minHeight: 42,
+    paddingHorizontal: 14,
+    paddingVertical: 9,
+    backgroundColor: theme.panel,
+    borderWidth: 1,
+    borderColor: theme.border,
+    borderRadius: 11,
+  },
+  scoutTeamSummary: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  statusDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: theme.emerald },
+  scoutSummaryLabel: { color: theme.muted, fontSize: 11 },
+  scoutTeamName: { color: theme.white, fontSize: 12, fontWeight: '800' },
+  scoutMetrics: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 16 },
+  scoutMetric: { color: theme.muted, fontSize: 10 },
+  metricHighlight: { color: theme.emerald, fontWeight: '800' },
+  runMetric: { color: theme.amber, fontWeight: '800' },
+  passMetric: { color: theme.cyan, fontWeight: '800' },
+  scoutToolbar: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
+  },
+  scoutSearch: {
+    minWidth: 210,
+    maxWidth: 340,
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    backgroundColor: theme.panel,
+    borderWidth: 1,
+    borderColor: theme.border,
+    borderRadius: 8,
+  },
+  scoutDatasetName: { color: '#64748b', fontSize: 10 },
+  scoutPanelHeader: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
+    paddingHorizontal: 18,
+    paddingVertical: 14,
+    borderBottomWidth: 1,
+    borderBottomColor: theme.border,
+  },
+  scoutPanelTitle: { color: theme.white, fontSize: 16, fontWeight: '800' },
+  scoutPanelSubtitle: { color: theme.muted, fontSize: 10, lineHeight: 15, marginTop: 4 },
+  tendencyGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 14, padding: 18 },
+  tendencyCard: {
+    flexGrow: 1,
+    flexBasis: 260,
+    maxWidth: 460,
+    gap: 10,
+    padding: 16,
+    backgroundColor: theme.panel,
+    borderWidth: 1,
+    borderColor: theme.border,
+    borderRadius: 12,
+  },
+  tendencyCardHeading: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10 },
+  tendencyCardTitle: { color: theme.white, fontSize: 12, fontWeight: '900', textTransform: 'uppercase' },
+  snapBadge: { paddingHorizontal: 7, paddingVertical: 4, backgroundColor: '#101f42', borderWidth: 1, borderColor: '#254887', borderRadius: 4 },
+  snapBadgeText: { color: '#93c5fd', fontSize: 8, fontWeight: '800' },
+  tendencyCardSubtitle: { color: theme.muted, fontSize: 10 },
+  runPassRow: { flexDirection: 'row', alignItems: 'center', gap: 9, marginTop: 2 },
+  runPassTrack: { height: 6, flex: 1, flexDirection: 'row', overflow: 'hidden', borderRadius: 5, backgroundColor: '#0b1220' },
+  runPassRun: { height: '100%', backgroundColor: '#10b981' },
+  runPassPass: { height: '100%', backgroundColor: '#0ea5e9' },
+  runPassLabel: { color: theme.muted, fontSize: 8, fontWeight: '700' },
+  tendencyDivider: { height: 1, backgroundColor: theme.border, marginTop: 2 },
+  tendencyEyebrow: { color: '#64748b', fontSize: 8, fontWeight: '800', letterSpacing: 0.4 },
+  tendencyFamily: { fontSize: 11, fontWeight: '800', marginTop: -6 },
+  tendencyInsight: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 7,
+    padding: 9,
+    backgroundColor: '#080e1b',
+    borderWidth: 1,
+    borderColor: theme.border,
+    borderRadius: 8,
+  },
+  tendencyInsightIcon: { color: theme.amber, fontSize: 11 },
+  tendencyInsightText: { color: '#cbd5e1', fontSize: 9, lineHeight: 14, flex: 1 },
+  quizCard: { alignSelf: 'center', width: '100%', maxWidth: 620, padding: 22, gap: 14 },
+  quizEyebrow: { color: theme.cyan, fontSize: 10, fontWeight: '800', letterSpacing: 1 },
+  quizSituation: { color: theme.white, fontSize: 20, fontWeight: '900' },
+  quizQuestion: { color: theme.muted, fontSize: 13 },
+  quizChoices: { flexDirection: 'row', gap: 10 },
+  quizChoice: { flex: 1, alignItems: 'center', padding: 14, backgroundColor: '#0b1220', borderWidth: 1, borderColor: '#334155', borderRadius: 9 },
+  quizChoiceCorrect: { borderColor: theme.emerald, backgroundColor: 'rgba(52, 211, 153, 0.12)' },
+  quizChoiceIncorrect: { borderColor: theme.rose, backgroundColor: 'rgba(251, 113, 133, 0.12)' },
+  quizChoiceText: { color: theme.white, fontWeight: '800' },
+  quizCorrectText: { color: theme.emerald, fontSize: 12, fontWeight: '700' },
+  quizIncorrectText: { color: theme.rose, fontSize: 12, fontWeight: '700' },
+  quizNextButton: { alignSelf: 'flex-end', padding: 10 },
+  quizNextText: { color: theme.cyan, fontSize: 12, fontWeight: '800' },
+  teamDrawerOverlay: { flex: 1, flexDirection: 'row', backgroundColor: 'rgba(2, 8, 23, 0.7)' },
+  teamDrawerBackdrop: { flex: 1 },
+  teamDrawer: {
+    width: '88%',
+    maxWidth: 360,
+    height: '100%',
+    backgroundColor: theme.panel,
+    borderRightWidth: 1,
+    borderColor: theme.border,
+    ...(Platform.OS === 'web'
+      ? { boxShadow: '4px 0 18px rgba(0, 0, 0, 0.35)' }
+      : { shadowColor: '#000', shadowOpacity: 0.35, shadowRadius: 18 }),
+    elevation: 16,
+  },
+  teamDrawerSafeArea: { flex: 1 },
+  teamDrawerHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 18,
+    paddingVertical: 16,
+    borderBottomWidth: 1,
+    borderColor: theme.border,
+  },
+  teamDrawerTitle: { color: theme.white, fontSize: 18, fontWeight: '800' },
+  teamDrawerSubtitle: { color: theme.muted, fontSize: 11, marginTop: 4 },
+  teamDrawerClose: { width: 34, height: 34, alignItems: 'center', justifyContent: 'center' },
+  teamDrawerCloseText: { color: theme.muted, fontSize: 26, lineHeight: 28 },
+  teamDrawerContent: { padding: 18, gap: 8 },
+  drawerSectionLabel: { color: '#64748b', fontSize: 10, fontWeight: '800', letterSpacing: 1.2 },
+  drawerNavItem: { paddingHorizontal: 12, paddingVertical: 11, borderRadius: 9 },
+  drawerNavItemActive: { backgroundColor: 'rgba(52, 211, 153, 0.12)' },
+  drawerNavText: { color: theme.text, fontSize: 13, fontWeight: '700' },
+  drawerNavTextActive: { color: theme.emerald },
+  drawerSectionHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginTop: 18,
+    marginBottom: 2,
+  },
+  drawerScheduleCount: { color: theme.muted, fontSize: 10, fontWeight: '700' },
+  teamDrawerHint: { color: theme.muted, fontSize: 11, lineHeight: 16, marginBottom: 5 },
+  scheduleEntry: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 12,
+    paddingVertical: 11,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: 'transparent',
+    backgroundColor: '#0b1220',
+  },
+  scheduleEntryActive: { borderColor: 'rgba(52, 211, 153, 0.65)', backgroundColor: 'rgba(52, 211, 153, 0.1)' },
+  scheduleEntryText: { flex: 1, gap: 3 },
+  scheduleEntryName: { color: theme.text, fontSize: 13, fontWeight: '700' },
+  scheduleEntryNameActive: { color: theme.emerald },
+  scheduleEntryWeek: { color: theme.muted, fontSize: 10 },
+  scheduleEntryCheck: { color: theme.emerald, fontSize: 17, fontWeight: '800', marginLeft: 8 },
+  addScheduleButton: {
+    alignItems: 'center',
+    paddingVertical: 12,
+    borderWidth: 1,
+    borderStyle: 'dashed',
+    borderColor: '#334155',
+    borderRadius: 10,
+    marginTop: 3,
+  },
+  addScheduleText: { color: theme.cyan, fontSize: 12, fontWeight: '800' },
+  teamForm: { gap: 10, padding: 12, backgroundColor: '#0b1220', borderRadius: 11, borderWidth: 1, borderColor: theme.border },
+  teamFormTitle: { color: theme.white, fontSize: 13, fontWeight: '800' },
+  teamFormActions: { flexDirection: 'row', alignItems: 'center', justifyContent: 'flex-end', gap: 8 },
+  teamFormSaveButton: { flex: 1 },
+  teamScheduleMessage: { color: theme.cyan, fontSize: 11, lineHeight: 16, marginTop: 4 },
   content: { padding: 16, gap: 18 },
   recordScreenContent: { padding: 16, gap: 14 },
   settingsContent: { padding: 16, gap: 14, width: '100%', maxWidth: 760, alignSelf: 'center' },
@@ -1909,6 +2646,18 @@ const styles = StyleSheet.create({
   uploadTitle: { color: theme.text, fontSize: 15, fontWeight: '700' },
   headerSpacer: { width: 44 },
   uploadContent: { padding: 18, gap: 14 },
+  uploadWeekButton: {
+    minHeight: 44,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 12,
+    backgroundColor: theme.bg,
+    borderWidth: 1,
+    borderColor: '#334155',
+    borderRadius: 10,
+  },
+  uploadWeekValue: { color: theme.text, fontSize: 13, fontWeight: '700' },
   uploadHero: {
     alignItems: 'center',
     paddingHorizontal: 18,

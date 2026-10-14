@@ -1,13 +1,18 @@
 import React from 'react';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import * as Google from 'expo-auth-session/providers/google';
+import * as DocumentPicker from 'expo-document-picker';
 import App from './App';
+import { getTeamDatasetKey, TEAM_SCHEDULE_KEY } from './teamSchedule';
 
 jest.mock('expo-auth-session/providers/google', () => ({
   useIdTokenAuthRequest: jest.fn(() => [null, null, jest.fn()]),
 }));
 jest.mock('expo-web-browser', () => ({
   maybeCompleteAuthSession: jest.fn(),
+}));
+jest.mock('expo-document-picker', () => ({
+  getDocumentAsync: jest.fn(),
 }));
 jest.mock('expo-constants', () => ({
   __esModule: true,
@@ -26,6 +31,11 @@ jest.mock('@react-native-async-storage/async-storage', () => (
   require('@react-native-async-storage/async-storage/jest/async-storage-mock')
 ));
 
+const openSection = (section) => {
+  fireEvent.press(screen.getByRole('button', { name: 'Open team menu' }));
+  fireEvent.press(screen.getByRole('button', { name: section }));
+};
+
 describe('Record Data', () => {
   beforeEach(async () => {
     Google.useIdTokenAuthRequest.mockReturnValue([null, null, jest.fn()]);
@@ -36,7 +46,7 @@ describe('Record Data', () => {
   it('adds a new play to the dashboard and saves it locally', async () => {
     render(<App />);
 
-    fireEvent.press(screen.getByText('Record Data'));
+    openSection('Record Data');
 
     fireEvent.changeText(screen.getByPlaceholderText('e.g. 10 or G'), '5');
     fireEvent.changeText(screen.getByPlaceholderText('e.g. OWN 25'), 'OWN 40');
@@ -49,7 +59,7 @@ describe('Record Data', () => {
     expect(screen.getByText('#55 · Test Counter')).toBeTruthy();
     expect(screen.getByText('50 valid plays in Updated playbook')).toBeTruthy();
 
-    fireEvent.press(screen.getByText('Dashboard'));
+    openSection('Dashboard');
     expect(screen.getByText('Displaying 50 matching plays')).toBeTruthy();
     await waitFor(() => {
       expect(screen.getByText('Saved locally on this device')).toBeTruthy();
@@ -83,6 +93,175 @@ describe('Record Data', () => {
 
 });
 
+describe('Scouting tabs', () => {
+  beforeEach(async () => {
+    const AsyncStorage = require('@react-native-async-storage/async-storage');
+    await AsyncStorage.clear();
+  });
+
+  it('switches between the tendency, quiz, call sheet, and snap log tabs', () => {
+    render(<App />);
+
+    fireEvent.press(screen.getByRole('tab', { name: 'Down & Distance' }));
+    expect(screen.getByText('Down & Distance Tendencies & Alignment Keys')).toBeTruthy();
+    expect(screen.getAllByText('2nd & Medium (M)').length).toBeGreaterThan(0);
+
+    fireEvent.press(screen.getByRole('tab', { name: 'Formations' }));
+    expect(screen.getByText('Formations Tendencies & Alignment Keys')).toBeTruthy();
+    expect(screen.getByText('Trips Right')).toBeTruthy();
+
+    fireEvent.press(screen.getByRole('tab', { name: 'DC Quiz Engine' }));
+    expect(screen.getByText('Was the recorded call a run or pass?')).toBeTruthy();
+
+    fireEvent.press(screen.getByRole('tab', { name: 'Beebe Call Sheet' }));
+    expect(screen.getByText('Down-and-distance tendencies, grouped into a quick sideline reference.')).toBeTruthy();
+
+    fireEvent.press(screen.getByRole('tab', { name: 'Snap Log' }));
+    expect(screen.getByText('All imported and recorded scouting snaps.')).toBeTruthy();
+  });
+});
+
+describe('Team schedule', () => {
+  beforeEach(async () => {
+    const AsyncStorage = require('@react-native-async-storage/async-storage');
+    await AsyncStorage.clear();
+    DocumentPicker.getDocumentAsync.mockReset();
+  });
+
+  it('imports a CSV into the selected week and keeps it locally when Cloud mode was active', async () => {
+    const AsyncStorage = require('@react-native-async-storage/async-storage');
+    const selectedTeam = { id: 'schedule-week-4', name: 'River City', week: '4' };
+    const otherWeek = { id: 'schedule-week-5', name: 'Lakeview', week: '5' };
+    await AsyncStorage.setItem(TEAM_SCHEDULE_KEY, JSON.stringify({
+      teams: [selectedTeam, otherWeek],
+      selectedTeamId: selectedTeam.id,
+    }));
+    await AsyncStorage.setItem('gridiron-scout.cloud-csv-url.v1', 'https://example.com/shared.csv');
+    await AsyncStorage.setItem('gridiron-scout.storage-mode.v1', 'cloud');
+    jest.spyOn(global, 'fetch').mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => [
+        'Clip,Down,Distance,Yardline,Formation,Play_Family,Play_Type,Gain',
+        'cloud-1,1,10,OWN 30,Trips Right,Cloud Play,RUN,5',
+      ].join('\n'),
+    });
+
+    const { unmount } = render(<App />);
+    await waitFor(() => {
+      expect(screen.getByText('Loaded 1 valid plays from the cloud CSV.')).toBeTruthy();
+    });
+    expect(screen.getAllByText('River City · Week 4').length).toBeGreaterThan(0);
+
+    DocumentPicker.getDocumentAsync.mockResolvedValue({
+      canceled: false,
+      assets: [{
+        name: 'week-4-scouting.csv',
+        uri: 'blob:week-4-scouting',
+        file: {
+          text: async () => [
+            'Clip,Down,Distance,Yardline,Formation,Play_Family,Play_Type,Gain',
+            'week-4-1,2,6,OPP 35,Trips Left,Week Four Counter,RUN,8',
+          ].join('\n'),
+        },
+      }],
+    });
+    fireEvent.press(screen.getByText('Import CSV'));
+    fireEvent.press(screen.getByRole('button', {
+      name: 'Select upload week, currently Week 4, River City',
+    }));
+    fireEvent.press(screen.getByRole('button', { name: 'Choose Week 5, Lakeview' }));
+    expect(screen.getByText('Week 5 · Lakeview')).toBeTruthy();
+    fireEvent.press(screen.getByText('Choose CSV file'));
+
+    await waitFor(() => {
+      expect(screen.getByText('The CSV replaces this schedule entry’s playbook and is saved locally. Importing selects this week and Local mode.')).toBeTruthy();
+    });
+    fireEvent.press(screen.getByText('Import to this week'));
+
+    await waitFor(async () => {
+      expect(await AsyncStorage.getItem('gridiron-scout.storage-mode.v1')).toBe('local');
+      const imported = JSON.parse(await AsyncStorage.getItem(getTeamDatasetKey(otherWeek.id)));
+      expect(imported.name).toBe('week-4-scouting.csv');
+      expect(imported.plays).toHaveLength(1);
+      expect(imported.plays[0].playFamily).toBe('Week Four Counter');
+      const schedule = JSON.parse(await AsyncStorage.getItem(TEAM_SCHEDULE_KEY));
+      expect(schedule.selectedTeamId).toBe(otherWeek.id);
+    });
+    expect(await AsyncStorage.getItem(getTeamDatasetKey(selectedTeam.id))).toBeNull();
+    expect(screen.getByText('Displaying 1 matching plays')).toBeTruthy();
+
+    openSection('Settings');
+    expect(screen.getByText('Imported 1 plays to Lakeview (Week 5). Local mode selected.')).toBeTruthy();
+
+    unmount();
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByText('Displaying 1 matching plays')).toBeTruthy();
+      expect(screen.getAllByText('Week Four Counter').length).toBeGreaterThan(0);
+    });
+  });
+
+  it('keeps a separate locally saved playbook for each schedule entry across restarts', async () => {
+    const AsyncStorage = require('@react-native-async-storage/async-storage');
+    const { unmount } = render(<App />);
+
+    await waitFor(async () => {
+      expect(await AsyncStorage.getItem(TEAM_SCHEDULE_KEY)).not.toBeNull();
+    });
+
+    fireEvent.press(screen.getByRole('button', { name: 'Open team menu' }));
+    fireEvent.press(screen.getByRole('button', { name: 'Add schedule entry' }));
+    fireEvent.changeText(screen.getByLabelText('Team or opponent name'), 'Northside Hawks');
+    fireEvent.changeText(screen.getByLabelText('Schedule week (optional)'), '3');
+    fireEvent.press(screen.getByRole('button', { name: 'Save schedule entry' }));
+
+    await waitFor(() => {
+      expect(screen.getByText('Northside Hawks')).toBeTruthy();
+    });
+    fireEvent.press(screen.getByRole('button', { name: 'Record Data' }));
+    fireEvent.changeText(screen.getByPlaceholderText('e.g. 10 or G'), '5');
+    fireEvent.changeText(screen.getByPlaceholderText('e.g. OWN 25'), 'OWN 40');
+    fireEvent.changeText(screen.getByPlaceholderText('e.g. Trips Right'), 'Trips Left');
+    fireEvent.changeText(screen.getByPlaceholderText('e.g. Inside Zone'), 'Hawks Counter');
+    fireEvent.changeText(screen.getByPlaceholderText('e.g. 5'), '4');
+    fireEvent.press(screen.getByText('Save play'));
+
+    let schedule;
+    await waitFor(async () => {
+      schedule = JSON.parse(await AsyncStorage.getItem(TEAM_SCHEDULE_KEY));
+      const hawks = schedule.teams.find((team) => team.name === 'Northside Hawks');
+      expect(hawks).toBeTruthy();
+      const hawksPlaybook = JSON.parse(await AsyncStorage.getItem(getTeamDatasetKey(hawks.id)));
+      expect(hawksPlaybook.plays).toHaveLength(1);
+      expect(hawksPlaybook.plays[0].playFamily).toBe('Hawks Counter');
+    });
+
+    fireEvent.press(screen.getByRole('button', { name: 'Open team menu' }));
+    fireEvent.press(screen.getByRole('button', { name: 'Select schedule entry My Team' }));
+    openSection('Dashboard');
+    await waitFor(() => {
+      expect(screen.getByText('Displaying 49 matching plays')).toBeTruthy();
+    });
+
+    fireEvent.press(screen.getByRole('button', { name: 'Open team menu' }));
+    fireEvent.press(screen.getByRole('button', { name: 'Select schedule entry Northside Hawks' }));
+    await waitFor(() => {
+      expect(screen.getByText('Displaying 1 matching plays')).toBeTruthy();
+    });
+
+    unmount();
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByText('Displaying 1 matching plays')).toBeTruthy();
+      expect(screen.getAllByText('Hawks Counter').length).toBeGreaterThan(0);
+    });
+    expect(schedule.selectedTeamId).toBe(
+      schedule.teams.find((team) => team.name === 'Northside Hawks').id,
+    );
+  });
+});
+
 describe('Settings', () => {
   beforeEach(async () => {
     jest.restoreAllMocks();
@@ -93,7 +272,7 @@ describe('Settings', () => {
 
   it('saves and restores the cloud CSV URL locally', async () => {
     const { unmount } = render(<App />);
-    fireEvent.press(screen.getByText('Settings'));
+    openSection('Settings');
     await waitFor(() => {
       expect(screen.getByText('No cloud CSV URL configured.')).toBeTruthy();
     });
@@ -112,7 +291,7 @@ describe('Settings', () => {
 
     unmount();
     render(<App />);
-    fireEvent.press(screen.getByText('Settings'));
+    openSection('Settings');
     await waitFor(() => {
       expect(screen.getByDisplayValue('https://drive.google.com/file/d/example/view')).toBeTruthy();
     });
@@ -140,7 +319,8 @@ describe('Settings', () => {
     }));
 
     render(<App />);
-    fireEvent.press(screen.getByText('Dashboard'));
+    openSection('Dashboard');
+    fireEvent.press(screen.getByRole('tab', { name: 'Down & Distance' }));
 
     await waitFor(() => {
       expect(screen.getAllByText('2nd & Medium (M)').length).toBeGreaterThan(0);
@@ -148,6 +328,12 @@ describe('Settings', () => {
     await waitFor(async () => {
       const saved = JSON.parse(await AsyncStorage.getItem('gridiron-scout.dataset.v1'));
       expect(saved.plays[0].downDistBucket).toBe('2nd & Medium (M)');
+      const schedule = JSON.parse(await AsyncStorage.getItem(TEAM_SCHEDULE_KEY));
+      expect(schedule.teams[0].name).toBe('My Team');
+      const migrated = JSON.parse(await AsyncStorage.getItem(
+        getTeamDatasetKey(schedule.selectedTeamId),
+      ));
+      expect(migrated.plays[0].downDistBucket).toBe('2nd & Medium (M)');
     });
   });
 
@@ -162,7 +348,7 @@ describe('Settings', () => {
       text: async () => csv,
     });
     render(<App />);
-    fireEvent.press(screen.getByText('Settings'));
+    openSection('Settings');
     await waitFor(() => {
       expect(screen.getByText('Local mode selected. Play data saves on this device.')).toBeTruthy();
     });
@@ -197,7 +383,7 @@ describe('Settings', () => {
 
   it('asks for a CSV URL before switching to Cloud when none is saved', async () => {
     render(<App />);
-    fireEvent.press(screen.getByText('Settings'));
+    openSection('Settings');
     await waitFor(() => {
       expect(screen.getByText('Local mode selected. Play data saves on this device.')).toBeTruthy();
     });
@@ -222,7 +408,7 @@ describe('Settings', () => {
       text: async () => csv,
     });
     render(<App />);
-    fireEvent.press(screen.getByText('Settings'));
+    openSection('Settings');
     await waitFor(() => {
       expect(screen.getByText('Local mode selected. Play data saves on this device.')).toBeTruthy();
     });
@@ -253,7 +439,7 @@ describe('Settings', () => {
       text: async () => csv,
     });
     render(<App />);
-    fireEvent.press(screen.getByText('Settings'));
+    openSection('Settings');
     await waitFor(() => {
       expect(screen.getByText('Local mode selected. Play data saves on this device.')).toBeTruthy();
     });
@@ -281,7 +467,7 @@ describe('Settings', () => {
     await waitFor(() => {
       expect(screen.getByText('Local mode selected. Saved play data loaded from this device.')).toBeTruthy();
     });
-    fireEvent.press(screen.getByText('Dashboard'));
+    openSection('Dashboard');
     expect(screen.getByText('Displaying 49 matching plays')).toBeTruthy();
   });
 
@@ -299,7 +485,7 @@ describe('Settings', () => {
     });
 
     render(<App />);
-    fireEvent.press(screen.getByText('Settings'));
+    openSection('Settings');
     await waitFor(() => {
       expect(screen.getByText('Cloud CSV loaded: 1 valid plays.')).toBeTruthy();
     });
@@ -324,7 +510,7 @@ describe('Settings', () => {
     });
 
     render(<App />);
-    fireEvent.press(screen.getByText('Settings'));
+    openSection('Settings');
     await waitFor(() => {
       expect(screen.getByText('Cloud CSV loaded: 1 valid plays.')).toBeTruthy();
     });
@@ -351,7 +537,7 @@ describe('Settings', () => {
     });
 
     render(<App />);
-    fireEvent.press(screen.getByText('Settings'));
+    openSection('Settings');
     await waitFor(() => {
       expect(screen.getByText('Cloud CSV loaded: 1 valid plays.')).toBeTruthy();
     });
@@ -371,7 +557,7 @@ describe('Settings', () => {
     jest.spyOn(global, 'fetch').mockRejectedValue(new TypeError('Failed to fetch'));
 
     render(<App />);
-    fireEvent.press(screen.getByText('Settings'));
+    openSection('Settings');
 
     await waitFor(() => {
       expect(screen.getAllByText(
@@ -403,7 +589,7 @@ describe('Settings', () => {
     });
 
     render(<App />);
-    fireEvent.press(screen.getByText('Settings'));
+    openSection('Settings');
 
     await waitFor(() => {
       expect(screen.getByText('Cloud CSV loaded: 1 valid plays.')).toBeTruthy();
@@ -424,7 +610,7 @@ describe('Settings', () => {
     await AsyncStorage.setItem('gridiron-scout.storage-mode.v1', 'cloud');
 
     render(<App />);
-    fireEvent.press(screen.getByText('Settings'));
+    openSection('Settings');
 
     await waitFor(() => {
       expect(screen.getAllByText('Sign in with Google to load the private Drive CSV.').length)

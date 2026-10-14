@@ -2,11 +2,11 @@
 
 Gridiron Scout is an Expo / React Native app that can also be exported as a static website.
 
-Use the **Dashboard** section to analyze plays, open **Record Data** to enter a scout snap manually, or use **Settings** to select Local or Cloud and save a Drive file or Sheets URL on this device. In Local mode, manual entries are added to the playbook and saved on the device.
+Use the horizontal scouting tabs to review **Field Zones**, **Down & Distance**, **Formations**, **Back Sets**, and **Play Families**, then open the **DC Quiz Engine**, **Beebe Call Sheet**, or **Snap Log**. The left-side menu contains **Record Data**, **Settings**, and the team schedule. Add schedule entries with a team/opponent name and an optional week; each has a separate playbook on the current device. On the CSV upload page, choose a scheduled week as the import destination; the imported data is saved to that entry, makes it active, and selects Local mode so it remains available even if Cloud mode was previously selected.
 
 Down-and-distance filters and tendency groups use the distance-to-go buckets Short (S, 1–3 yards), Medium (M, 4–6 yards), and Long (L, 7+ yards), grouped separately by down. Goal-to-go is treated as short.
 
-Cloud mode loads and parses the selected data when enabled and when the app starts. Public Google Sheets can be loaded from their Sheets URL. Private Google Drive CSV files are fetched through the authenticated Cloud Run proxy in `server/`: users sign in with Google, the backend verifies the ID token and an email allowlist, then its read-only runtime identity fetches only the configured Drive file. The browser never contacts Drive directly, so the Drive CORS restriction is avoided without publishing the CSV. Cloud data is read-only: plays recorded or other data changes made in the app are not uploaded. Local mode uses the playbook saved on the current device.
+Cloud mode loads and parses the selected data when enabled and when the app starts. Public Google Sheets can be loaded from their Sheets URL. Private Google Drive CSV files are fetched through the authenticated Cloud Run proxy in `server/`: users sign in with Google, the backend verifies the ID token and an email allowlist, then its read-only runtime identity fetches only the configured Drive file. The browser never contacts Drive directly, so the Drive CORS restriction is avoided without publishing the CSV. Cloud data is read-only: plays recorded or other data changes made in the app are not uploaded. CSV imports and manual play entries are saved locally; Local mode uses the selected schedule entry’s playbook on the current device.
 
 ## Configure private Drive CSV access
 
@@ -64,4 +64,4 @@ npm run build:web
 
 Local builds use the root path. The GitHub Actions build supplies the repository path automatically.
 
-In Local mode, CSV uploads and saved play data remain in the current device or browser's local storage. The cloud URL and storage preference are also saved locally; Cloud mode reads data from the configured source but does not write changes back to it.
+In Local mode, CSV uploads and saved play data remain in the current device or browser's local storage. Existing playbooks are migrated into the default **My Team** schedule entry. The schedule, selected entry, cloud URL, and storage preference are also saved locally. Cloud mode reads the configured shared source but does not write changes back to it; schedule entries use the same configured cloud CSV while Cloud mode is selected.
