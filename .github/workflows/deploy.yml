@@ -37,6 +37,9 @@ jobs:
         run: npm ci
 
       - name: Build web bundle
+        env:
+          EXPO_PUBLIC_GRIDIRON_CLOUD_API_URL: ${{ vars.GRIDIRON_CLOUD_API_URL }}
+          EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID: ${{ vars.GOOGLE_WEB_CLIENT_ID }}
         run: npm run build:web
 
       - name: Setup Pages

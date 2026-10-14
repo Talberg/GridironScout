@@ -1,0 +1,15 @@
+{
+  "name": "gridiron-scout-drive-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "test": "node --test api.node-test.js"
+  },
+  "dependencies": {
+    "google-auth-library": "^9.15.1"
+  }
+}

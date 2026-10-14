@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import {
   SafeAreaView,
   ScrollView,
+  Platform,
   StatusBar,
   StyleSheet,
   Text,
@@ -12,9 +13,25 @@ import {
   Pressable,
   TextInput,
 } from 'react-native';
+import Constants from 'expo-constants';
 import * as DocumentPicker from 'expo-document-picker';
 import * as FileSystem from 'expo-file-system';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as Google from 'expo-auth-session/providers/google';
+import * as WebBrowser from 'expo-web-browser';
+import { fetchDriveCsvThroughProxy, getGoogleDriveFileId } from './cloudProxy';
+import {
+  getCsvDownloadUrl,
+  isGoogleSheetsUrl,
+  loadGoogleSheetsCsvWithJsonp,
+} from './cloudCsv';
+import {
+  compareDownDistanceBuckets,
+  getDownDistanceBucket,
+  refreshDownDistanceBuckets,
+} from './downDistance';
+
+WebBrowser.maybeCompleteAuthSession();
 
 const DEFAULT_FOOTBALL_DATA = `Clip,Down,Distance,Yardline,Field_Zone,Formation,Back_Set,Play_Family,Play_Type,Gain,Penalty
 1,1,10,OWN 25,Backed Up,Trips Right,Gun Pistol,Inside Zone,RUN,4,NO
@@ -90,6 +107,8 @@ const theme = {
   white: '#ffffff',
 };
 const LOCAL_DATA_KEY = 'gridiron-scout.dataset.v1';
+const LOCAL_CSV_URL_KEY = 'gridiron-scout.cloud-csv-url.v1';
+const STORAGE_MODE_KEY = 'gridiron-scout.storage-mode.v1';
 
 function parseCsv(content) {
   const rows = [];
@@ -234,7 +253,7 @@ function normalizePlayRecord(record) {
     playType: normalizedPlayType,
     gain: gainValue,
     resultCall: resultCall || playFamily,
-    downDistBucket: `${down}${distance.toUpperCase() === 'G' ? 'G' : distance}`,
+    downDistBucket: getDownDistanceBucket(down, distance),
   };
 }
 
@@ -257,6 +276,29 @@ function buildDataset(text) {
   return { plays: cleaned, rowCount: parsed.length, penalties, rejected: parsed.length - cleaned.length };
 }
 
+function cloudCsvLoadError(error, sourceUrl) {
+  const detail = error.message || 'The CSV could not be read.';
+  if (/^(The authenticated Drive proxy|Sign in with Google|Google sign-in|This Google account|Enter a valid Cloud Run)/i.test(detail)) {
+    return detail;
+  }
+  if (/failed to fetch|network request failed|load failed/i.test(detail)) {
+    if (/drive\.google\.com/i.test(sourceUrl)) {
+      return 'Could not reach the authenticated Drive proxy. Confirm its Cloud Run URL and allowed app origin.';
+    }
+    return 'Connection failed. This CSV host may block browser access (CORS). Use a publicly published Google Sheets URL or a CSV host that allows cross-origin requests.';
+  }
+  return `Could not load cloud CSV: ${detail} Confirm the link serves a CSV and that the file is shared for access.`;
+}
+
+function isStoredPlaybook(value) {
+  return Array.isArray(value?.plays) && value.plays.every((play) => (
+    play &&
+    typeof play.clip === 'string' &&
+    typeof play.downDistBucket === 'string' &&
+    typeof play.gain === 'number'
+  ));
+}
+
 function compactNumber(value) {
   return Number(value).toLocaleString();
 }
@@ -272,6 +314,22 @@ function StatCard({ label, value, sublabel, accent = '#fff' }) {
       <Text style={styles.statLabel}>{label}</Text>
       <Text style={[styles.statValue, { color: accent }]}>{value}</Text>
       <Text style={styles.statSub}>{sublabel}</Text>
+    </View>
+  );
+}
+
+function RecordField({ label, value, onChangeText, placeholder, keyboardType = 'default', style }) {
+  return (
+    <View style={[styles.recordField, style]}>
+      <Text style={styles.recordFieldLabel}>{label}</Text>
+      <TextInput
+        value={value}
+        onChangeText={onChangeText}
+        placeholder={placeholder}
+        placeholderTextColor="#64748b"
+        keyboardType={keyboardType}
+        style={styles.recordInput}
+      />
     </View>
   );
 }
@@ -373,7 +431,7 @@ function HierarchyTree({ plays }) {
   return (
     <View style={styles.hierarchyList}>
       {Object.keys(hierarchy)
-        .sort()
+        .sort(compareDownDistanceBuckets)
         .map((downLabel) => {
           const level = hierarchy[downLabel];
           const avgGain = (level.totalGain / level.count).toFixed(1);
@@ -438,13 +496,50 @@ function HierarchyTree({ plays }) {
 }
 
 export default function App() {
+  const appConfig = Constants.expoConfig?.extra || {};
+  const googleWebClientId = appConfig.googleWebClientId || '';
+  const googleIosClientId = appConfig.googleIosClientId || '';
+  const googleAndroidClientId = appConfig.googleAndroidClientId || '';
+  const gridironCloudApiUrl = appConfig.gridironCloudApiUrl || '';
+  const platformGoogleClientId = Platform.OS === 'ios'
+    ? googleIosClientId
+    : Platform.OS === 'android'
+      ? googleAndroidClientId
+      : googleWebClientId;
+  const googleClientIdConfigured = Boolean(platformGoogleClientId);
+  const [googleRequest, googleAuthResponse, promptGoogleSignIn] = Google.useIdTokenAuthRequest({
+    clientId: platformGoogleClientId || 'google-client-id-not-configured',
+    webClientId: googleWebClientId || undefined,
+    iosClientId: googleIosClientId || undefined,
+    androidClientId: googleAndroidClientId || undefined,
+    scopes: ['openid', 'profile', 'email'],
+    selectAccount: true,
+  });
   const sampleData = useMemo(() => buildDataset(DEFAULT_FOOTBALL_DATA), []);
   const [dataset, setDataset] = useState(sampleData.plays);
   const [rawRowCount, setRawRowCount] = useState(sampleData.rowCount);
   const [datasetName, setDatasetName] = useState('Sample dataset');
   const [storageReady, setStorageReady] = useState(false);
   const [storageMessage, setStorageMessage] = useState('');
-  const uniqueDownDist = ['ALL', ...Array.from(new Set(dataset.map((p) => p.downDistBucket))).sort()];
+  const [storageMode, setStorageMode] = useState('local');
+  const [storageModeMessage, setStorageModeMessage] = useState('Loading storage preference…');
+  const [cloudCsvUrl, setCloudCsvUrl] = useState('');
+  const [cloudCsvUrlInput, setCloudCsvUrlInput] = useState('');
+  const [settingsReady, setSettingsReady] = useState(false);
+  const [settingsMessage, setSettingsMessage] = useState('Loading settings…');
+  const [cloudLoadMessage, setCloudLoadMessage] = useState('Cloud CSV has not been loaded.');
+  const [cloudLoading, setCloudLoading] = useState(false);
+  const [cloudRefreshKey, setCloudRefreshKey] = useState(0);
+  const [cloudUrlPromptVisible, setCloudUrlPromptVisible] = useState(false);
+  const [cloudUrlDraft, setCloudUrlDraft] = useState('');
+  const [cloudUrlPromptError, setCloudUrlPromptError] = useState('');
+  const [cloudUrlSaving, setCloudUrlSaving] = useState(false);
+  const [googleIdToken, setGoogleIdToken] = useState('');
+  const [googleAuthMessage, setGoogleAuthMessage] = useState('');
+  const uniqueDownDist = [
+    'ALL',
+    ...Array.from(new Set(dataset.map((p) => p.downDistBucket))).sort(compareDownDistanceBuckets),
+  ];
   const uniqueZones = ['ALL', ...Array.from(new Set(dataset.map((p) => p.fieldZone))).sort()];
   const uniqueFormations = ['ALL', ...Array.from(new Set(dataset.map((p) => p.formation))).sort()];
   const uniqueBackSets = ['ALL', ...Array.from(new Set(dataset.map((p) => p.backSet))).sort()];
@@ -465,22 +560,87 @@ export default function App() {
   const [uploadError, setUploadError] = useState('');
   const [uploadPreview, setUploadPreview] = useState(null);
   const [clearConfirmVisible, setClearConfirmVisible] = useState(false);
+  const [activeSection, setActiveSection] = useState('dashboard');
+  const [recordForm, setRecordForm] = useState({
+    clip: '',
+    down: '1',
+    distance: '',
+    yardline: '',
+    fieldZone: '',
+    formation: '',
+    backSet: '',
+    playFamily: '',
+    playType: 'RUN',
+    gain: '',
+    resultCall: '',
+  });
+  const [recordMessage, setRecordMessage] = useState('');
+
+  useEffect(() => {
+    if (!googleAuthResponse) return;
+    if (googleAuthResponse.type === 'success') {
+      const idToken = googleAuthResponse.params?.id_token
+        || googleAuthResponse.authentication?.idToken;
+      if (idToken) {
+        setGoogleIdToken(idToken);
+        setGoogleAuthMessage('Google account connected for this session.');
+      } else {
+        setGoogleAuthMessage('Google sign-in did not return an ID token. Check the OAuth client configuration.');
+      }
+    } else if (googleAuthResponse.type === 'error') {
+      setGoogleAuthMessage(
+        googleAuthResponse.error?.message || 'Google sign-in failed. Check the OAuth client configuration.',
+      );
+    }
+  }, [googleAuthResponse]);
+
+  useEffect(() => {
+    let active = true;
+    const restoreCloudCsvUrl = async () => {
+      try {
+        const [savedUrl, savedMode] = await Promise.all([
+          AsyncStorage.getItem(LOCAL_CSV_URL_KEY),
+          AsyncStorage.getItem(STORAGE_MODE_KEY),
+        ]);
+        if (!active) return;
+        setCloudCsvUrl(savedUrl || '');
+        setCloudCsvUrlInput(savedUrl || '');
+        setSettingsMessage(savedUrl ? 'Cloud CSV URL saved on this device.' : 'No cloud CSV URL configured.');
+        const mode = savedMode === 'cloud' ? 'cloud' : 'local';
+        setStorageMode(mode);
+        setStorageModeMessage(mode === 'cloud'
+          ? 'Cloud mode selected. Loading the saved CSV…'
+          : 'Local mode selected. Play data saves on this device.');
+      } catch (error) {
+        if (active) setSettingsMessage(`Could not load settings: ${error.message}`);
+        if (active) setStorageModeMessage(`Could not load storage preference: ${error.message}`);
+      } finally {
+        if (active) setSettingsReady(true);
+      }
+    };
+    restoreCloudCsvUrl();
+    return () => {
+      active = false;
+    };
+  }, []);
 
   useEffect(() => {
     let active = true;
     const restoreLocalData = async () => {
       try {
-        const savedValue = await AsyncStorage.getItem(LOCAL_DATA_KEY);
+        const [savedValue, savedMode] = await Promise.all([
+          AsyncStorage.getItem(LOCAL_DATA_KEY),
+          AsyncStorage.getItem(STORAGE_MODE_KEY),
+        ]);
         if (!active) return;
+        if (savedMode === 'cloud') {
+          setStorageMessage('Cloud mode is active. Fetching the configured CSV…');
+          return;
+        }
         if (savedValue) {
           const saved = JSON.parse(savedValue);
-          if (Array.isArray(saved.plays) && saved.plays.every((play) => (
-            play &&
-            typeof play.clip === 'string' &&
-            typeof play.downDistBucket === 'string' &&
-            typeof play.gain === 'number'
-          ))) {
-            setDataset(saved.plays);
+          if (isStoredPlaybook(saved)) {
+            setDataset(refreshDownDistanceBuckets(saved.plays));
             setRawRowCount(Number.isInteger(saved.rowCount) ? saved.rowCount : saved.plays.length);
             setDatasetName(typeof saved.name === 'string' ? saved.name : 'Saved dataset');
           } else {
@@ -500,7 +660,72 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!storageReady) return undefined;
+    if (!settingsReady || !storageReady || storageMode !== 'cloud') return undefined;
+    if (!cloudCsvUrl.trim()) {
+      setCloudUrlDraft('');
+      setCloudUrlPromptError('');
+      setCloudUrlPromptVisible(true);
+      return undefined;
+    }
+
+    let active = true;
+    const loadCloudCsv = async () => {
+      setCloudLoading(true);
+      const sourceUrl = cloudCsvUrl.trim();
+      const driveFileId = getGoogleDriveFileId(sourceUrl);
+      setCloudLoadMessage(driveFileId
+        ? 'Loading private CSV through the authenticated proxy…'
+        : isGoogleSheetsUrl(sourceUrl)
+          ? 'Loading CSV from Google Sheets…'
+          : 'Loading cloud CSV…');
+      setStorageModeMessage('Cloud mode selected. Loading CSV from the saved URL…');
+      try {
+        let csvText;
+        if (driveFileId) {
+          csvText = await fetchDriveCsvThroughProxy({
+            apiUrl: gridironCloudApiUrl,
+            fileUrl: sourceUrl,
+            idToken: googleIdToken,
+          });
+        } else if (Platform.OS === 'web' && isGoogleSheetsUrl(sourceUrl)) {
+          csvText = await loadGoogleSheetsCsvWithJsonp(sourceUrl);
+        } else {
+          const response = await fetch(getCsvDownloadUrl(sourceUrl));
+          if (!response.ok) {
+            throw new Error(`The CSV request failed with HTTP ${response.status}.`);
+          }
+          csvText = await response.text();
+        }
+        const parsed = buildDataset(csvText);
+        if (parsed.plays.length === 0) {
+          throw new Error('No valid plays were found. Check that the link serves a CSV with the required play columns.');
+        }
+        if (!active) return;
+        setDataset(parsed.plays);
+        setRawRowCount(parsed.rowCount);
+        setDatasetName('Cloud CSV');
+        setFilters({ downDist: 'ALL', fieldZone: 'ALL', formation: 'ALL', backSet: 'ALL', playFamily: 'ALL', query: '' });
+        setCloudLoadMessage(`Loaded ${compactNumber(parsed.plays.length)} valid plays from the cloud CSV.`);
+        setStorageModeMessage(`Cloud CSV loaded: ${compactNumber(parsed.plays.length)} valid plays.`);
+        setSettingsMessage('Cloud CSV loaded successfully.');
+      } catch (error) {
+        if (!active) return;
+        const message = cloudCsvLoadError(error, cloudCsvUrl.trim());
+        setCloudLoadMessage(message);
+        setStorageModeMessage('Cloud CSV could not be loaded. Your current play data has been left unchanged.');
+        setSettingsMessage(message);
+      } finally {
+        if (active) setCloudLoading(false);
+      }
+    };
+    loadCloudCsv();
+    return () => {
+      active = false;
+    };
+  }, [cloudCsvUrl, cloudRefreshKey, gridironCloudApiUrl, googleIdToken, settingsReady, storageMode]);
+
+  useEffect(() => {
+    if (!storageReady || storageMode !== 'local') return undefined;
     let active = true;
     const persistLocalData = async () => {
       try {
@@ -518,7 +743,7 @@ export default function App() {
     return () => {
       active = false;
     };
-  }, [dataset, datasetName, rawRowCount, storageReady]);
+  }, [dataset, datasetName, rawRowCount, storageMode, storageReady]);
 
   const chooseCsvFile = async () => {
     setUploadError('');
@@ -591,6 +816,49 @@ export default function App() {
     setClearConfirmVisible(false);
   };
 
+  const addRecordedPlay = () => {
+    const play = normalizePlayRecord({
+      Clip: recordForm.clip.trim() || String(rawRowCount + 1),
+      Down: recordForm.down,
+      Distance: recordForm.distance.trim(),
+      Yardline: recordForm.yardline.trim(),
+      Field_Zone: recordForm.fieldZone.trim(),
+      Formation: recordForm.formation.trim(),
+      Back_Set: recordForm.backSet.trim(),
+      Play_Family: recordForm.playFamily.trim(),
+      Play_Type: recordForm.playType,
+      Gain: recordForm.gain.trim(),
+      Result: recordForm.resultCall.trim(),
+      Penalty: 'NO',
+    });
+
+    if (!play) {
+      setRecordMessage('Check the required fields and values. Down must be 1–4, distance must be a number or G, and play type must be RUN or PASS.');
+      return;
+    }
+
+    setDataset((current) => [...current, play]);
+    setRawRowCount((count) => count + 1);
+    setDatasetName('Updated playbook');
+    setFilters({ downDist: 'ALL', fieldZone: 'ALL', formation: 'ALL', backSet: 'ALL', playFamily: 'ALL', query: '' });
+    setRecordForm({
+      clip: '',
+      down: '1',
+      distance: '',
+      yardline: '',
+      fieldZone: '',
+      formation: '',
+      backSet: '',
+      playFamily: '',
+      playType: 'RUN',
+      gain: '',
+      resultCall: '',
+    });
+    setRecordMessage(storageMode === 'cloud'
+      ? `Play #${play.clip} added as a temporary local edit. It is not saved or written to the cloud CSV.`
+      : `Play #${play.clip} recorded. It is saved locally with your playbook.`);
+  };
+
   const filteredPlays = useMemo(() => {
     return dataset.filter((play) => {
       if (filters.downDist !== 'ALL' && play.downDistBucket !== filters.downDist) return false;
@@ -627,6 +895,152 @@ export default function App() {
 
   const resetFilters = () => setFilters({ downDist: 'ALL', fieldZone: 'ALL', formation: 'ALL', backSet: 'ALL', playFamily: 'ALL', query: '' });
 
+  const selectStorageMode = async (mode) => {
+    if (mode === 'cloud' && !cloudCsvUrl.trim()) {
+      setCloudUrlDraft('');
+      setCloudUrlPromptError('');
+      setCloudUrlPromptVisible(true);
+      return;
+    }
+
+    try {
+      let localPlaybook = null;
+      if (mode === 'local') {
+        const savedValue = await AsyncStorage.getItem(LOCAL_DATA_KEY);
+        if (savedValue) {
+          const saved = JSON.parse(savedValue);
+          if (isStoredPlaybook(saved)) {
+            localPlaybook = saved;
+          } else {
+            throw new Error('Saved local play data is invalid.');
+          }
+        }
+      }
+      await AsyncStorage.setItem(STORAGE_MODE_KEY, mode);
+      setStorageMode(mode);
+      if (mode === 'cloud') {
+        setStorageModeMessage('Cloud mode selected. Loading CSV from the saved URL…');
+      } else if (localPlaybook) {
+        setDataset(refreshDownDistanceBuckets(localPlaybook.plays));
+        setRawRowCount(Number.isInteger(localPlaybook.rowCount) ? localPlaybook.rowCount : localPlaybook.plays.length);
+        setDatasetName(typeof localPlaybook.name === 'string' ? localPlaybook.name : 'Saved dataset');
+        setFilters({ downDist: 'ALL', fieldZone: 'ALL', formation: 'ALL', backSet: 'ALL', playFamily: 'ALL', query: '' });
+        setStorageModeMessage('Local mode selected. Saved play data loaded from this device.');
+      } else {
+        setDataset(sampleData.plays);
+        setRawRowCount(sampleData.rowCount);
+        setDatasetName('Sample dataset');
+        setFilters({ downDist: 'ALL', fieldZone: 'ALL', formation: 'ALL', backSet: 'ALL', playFamily: 'ALL', query: '' });
+        setStorageModeMessage('Local mode selected. Sample play data loaded; no local playbook was saved yet.');
+      }
+      if (mode === 'local') setCloudLoading(false);
+    } catch (error) {
+      setStorageModeMessage(`Could not save storage preference: ${error.message}`);
+    }
+  };
+
+  const validateCloudCsvUrl = (value) => {
+    try {
+      const parsedUrl = new URL(value.trim());
+      if (parsedUrl.protocol !== 'https:' && parsedUrl.protocol !== 'http:') {
+        return 'Enter a valid Google Drive, Sheets or CSV URL beginning with http:// or https://.';
+      }
+      return '';
+    } catch {
+      return 'Enter a valid Google Drive, Sheets or CSV URL beginning with http:// or https://.';
+    }
+  };
+
+  const saveCloudCsvUrl = async () => {
+    const trimmedUrl = cloudCsvUrlInput.trim();
+    const validationError = trimmedUrl ? validateCloudCsvUrl(trimmedUrl) : '';
+    if (validationError) {
+      setSettingsMessage(validationError);
+      return;
+    }
+
+    try {
+      if (trimmedUrl) {
+        await AsyncStorage.setItem(LOCAL_CSV_URL_KEY, trimmedUrl);
+        setCloudCsvUrl(trimmedUrl);
+        setCloudCsvUrlInput(trimmedUrl);
+        setSettingsMessage(storageMode === 'cloud'
+          ? 'Cloud CSV URL saved. Loading the latest data…'
+          : 'Cloud CSV URL saved on this device. Select Cloud to load it.');
+          if (storageMode === 'cloud') setCloudRefreshKey((key) => key + 1);
+      } else {
+        await AsyncStorage.removeItem(LOCAL_CSV_URL_KEY);
+        setSettingsMessage('Cloud CSV URL removed.');
+        setCloudCsvUrl('');
+        setCloudCsvUrlInput('');
+      }
+    } catch (error) {
+      setSettingsMessage(`Could not save the cloud CSV URL: ${error.message}`);
+    }
+  };
+
+  const clearCloudCsvUrl = async () => {
+    try {
+      await AsyncStorage.removeItem(LOCAL_CSV_URL_KEY);
+      setCloudCsvUrl('');
+      setCloudCsvUrlInput('');
+      if (storageMode === 'cloud') {
+        await selectStorageMode('local');
+      }
+      setSettingsMessage('Cloud CSV URL cleared.');
+    } catch (error) {
+      setSettingsMessage(`Could not clear the cloud CSV URL: ${error.message}`);
+    }
+  };
+
+  const saveCloudUrlAndLoad = async () => {
+    const trimmedUrl = cloudUrlDraft.trim();
+    const validationError = validateCloudCsvUrl(trimmedUrl);
+    if (validationError) {
+      setCloudUrlPromptError(validationError);
+      return;
+    }
+
+    setCloudUrlSaving(true);
+    setCloudUrlPromptError('');
+    try {
+      await Promise.all([
+        AsyncStorage.setItem(LOCAL_CSV_URL_KEY, trimmedUrl),
+        AsyncStorage.setItem(STORAGE_MODE_KEY, 'cloud'),
+      ]);
+      setCloudCsvUrl(trimmedUrl);
+      setCloudCsvUrlInput(trimmedUrl);
+      setStorageMode('cloud');
+      setCloudUrlPromptVisible(false);
+      setSettingsMessage('Cloud CSV URL saved. Loading the latest data…');
+    } catch (error) {
+      setCloudUrlPromptError(`Could not save the cloud URL: ${error.message}`);
+    } finally {
+      setCloudUrlSaving(false);
+    }
+  };
+
+  const startGoogleSignIn = async () => {
+    setGoogleAuthMessage('');
+    try {
+      await promptGoogleSignIn();
+    } catch (error) {
+      setGoogleAuthMessage(`Google sign-in failed: ${error.message}`);
+    }
+  };
+
+  const signOutOfCloud = () => {
+    setGoogleIdToken('');
+    setGoogleAuthMessage('Signed out of private Cloud access.');
+  };
+
+  const cancelCloudUrlPrompt = () => {
+    setCloudUrlPromptVisible(false);
+    if (storageMode === 'cloud') {
+      selectStorageMode('local');
+    }
+  };
+
   return (
     <SafeAreaView style={styles.container}>
       <StatusBar barStyle="light-content" />
@@ -657,6 +1071,34 @@ export default function App() {
         </View>
       </View>
 
+      <View style={styles.navigation}>
+        <TouchableOpacity
+          style={[styles.navItem, activeSection === 'dashboard' && styles.navItemActive]}
+          onPress={() => setActiveSection('dashboard')}
+          accessibilityRole="button"
+          accessibilityState={{ selected: activeSection === 'dashboard' }}
+        >
+          <Text style={[styles.navItemText, activeSection === 'dashboard' && styles.navItemTextActive]}>Dashboard</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.navItem, activeSection === 'record' && styles.navItemActive]}
+          onPress={() => { setActiveSection('record'); setRecordMessage(''); }}
+          accessibilityRole="button"
+          accessibilityState={{ selected: activeSection === 'record' }}
+        >
+          <Text style={[styles.navItemText, activeSection === 'record' && styles.navItemTextActive]}>Record Data</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.navItem, activeSection === 'settings' && styles.navItemActive]}
+          onPress={() => setActiveSection('settings')}
+          accessibilityRole="button"
+          accessibilityState={{ selected: activeSection === 'settings' }}
+        >
+          <Text style={[styles.navItemText, activeSection === 'settings' && styles.navItemTextActive]}>Settings</Text>
+        </TouchableOpacity>
+      </View>
+
+      {activeSection === 'dashboard' ? (
       <ScrollView contentContainerStyle={styles.content}>
         <View style={styles.statsGrid}>
           <StatCard label="Total Clips Ingested" value={compactNumber(rawRowCount)} sublabel={datasetName} accent={theme.text} />
@@ -668,7 +1110,9 @@ export default function App() {
         </View>
 
         <View style={styles.filterPanel}>
-          <Text style={styles.storageMessage}>{storageMessage || 'Saving data locally…'}</Text>
+          <Text style={styles.storageMessage}>
+            {storageMode === 'cloud' ? cloudLoadMessage : storageMessage || 'Saving data locally…'}
+          </Text>
           <View style={styles.filterHeader}>
             <Text style={styles.filterTitle}>Hierarchical Drilldown Filters</Text>
             <TouchableOpacity onPress={resetFilters}>
@@ -689,6 +1133,9 @@ export default function App() {
             </View>
           </View>
 
+          <Text style={styles.downDistanceHint}>
+            Short (S): 1–3 yds · Medium (M): 4–6 yds · Long (L): 7+ yds
+          </Text>
           <View style={styles.filtersGrid}>
             <FilterSelect label="1. Down & Distance" value={filters.downDist === 'ALL' ? 'All Downs & Distances' : filters.downDist} options={uniqueDownDist} onPress={() => setModalConfig({ title: 'Down & Distance', options: uniqueDownDist, selectedValue: filters.downDist, keyName: 'downDist', onSelect: (value) => setFilters((prev) => ({ ...prev, downDist: value })) })} />
             <FilterSelect label="2. Field Zone" value={filters.fieldZone === 'ALL' ? 'All Field Zones' : filters.fieldZone} options={uniqueZones} onPress={() => setModalConfig({ title: 'Field Zone', options: uniqueZones, selectedValue: filters.fieldZone, keyName: 'fieldZone', onSelect: (value) => setFilters((prev) => ({ ...prev, fieldZone: value })) })} />
@@ -734,6 +1181,277 @@ export default function App() {
           </ScrollView>
         </View>
       </ScrollView>
+      ) : activeSection === 'record' ? (
+        <ScrollView contentContainerStyle={styles.recordScreenContent} keyboardShouldPersistTaps="handled">
+          <View style={styles.recordIntro}>
+            <Text style={styles.recordTitle}>Record a play</Text>
+            <Text style={styles.recordDescription}>
+              Enter a scout snap below. Saved entries are added to the dashboard and stored locally on this device.
+            </Text>
+            <Text style={styles.recordCount}>{compactNumber(dataset.length)} valid plays in {datasetName}</Text>
+          </View>
+
+          <View style={styles.recordCard}>
+            <Text style={styles.recordSectionTitle}>Play situation</Text>
+            <View style={styles.recordFieldsRow}>
+              <RecordField
+                label="Clip # (optional)"
+                value={recordForm.clip}
+                onChangeText={(clip) => setRecordForm((form) => ({ ...form, clip }))}
+                placeholder={`Auto: ${rawRowCount + 1}`}
+                style={styles.recordHalfField}
+              />
+              <View style={styles.recordHalfField}>
+                <Text style={styles.recordFieldLabel}>Down</Text>
+                <View style={styles.segmentRow}>
+                  {['1', '2', '3', '4'].map((down) => (
+                    <TouchableOpacity
+                      key={down}
+                      style={[styles.segmentButton, recordForm.down === down && styles.segmentButtonActive]}
+                      onPress={() => setRecordForm((form) => ({ ...form, down }))}
+                    >
+                      <Text style={[styles.segmentText, recordForm.down === down && styles.segmentTextActive]}>{down}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+              </View>
+            </View>
+            <View style={styles.recordFieldsRow}>
+              <RecordField
+                label="Distance *"
+                value={recordForm.distance}
+                onChangeText={(distance) => setRecordForm((form) => ({ ...form, distance }))}
+                placeholder="e.g. 10 or G"
+                style={styles.recordHalfField}
+              />
+              <RecordField
+                label="Yardline *"
+                value={recordForm.yardline}
+                onChangeText={(yardline) => setRecordForm((form) => ({ ...form, yardline }))}
+                placeholder="e.g. OWN 25"
+                style={styles.recordHalfField}
+              />
+            </View>
+            <RecordField
+              label="Field zone (optional)"
+              value={recordForm.fieldZone}
+              onChangeText={(fieldZone) => setRecordForm((form) => ({ ...form, fieldZone }))}
+              placeholder="Auto-detected from yardline if blank"
+            />
+          </View>
+
+          <View style={styles.recordCard}>
+            <Text style={styles.recordSectionTitle}>Play call</Text>
+            <RecordField
+              label="Formation *"
+              value={recordForm.formation}
+              onChangeText={(formation) => setRecordForm((form) => ({ ...form, formation }))}
+              placeholder="e.g. Trips Right"
+            />
+            <RecordField
+              label="Back set (optional)"
+              value={recordForm.backSet}
+              onChangeText={(backSet) => setRecordForm((form) => ({ ...form, backSet }))}
+              placeholder="e.g. Gun Pistol"
+            />
+            <RecordField
+              label="Play family *"
+              value={recordForm.playFamily}
+              onChangeText={(playFamily) => setRecordForm((form) => ({ ...form, playFamily }))}
+              placeholder="e.g. Inside Zone"
+            />
+            <View style={styles.recordFieldsRow}>
+              <View style={styles.recordHalfField}>
+                <Text style={styles.recordFieldLabel}>Play type *</Text>
+                <View style={styles.segmentRow}>
+                  {['RUN', 'PASS'].map((playType) => (
+                    <TouchableOpacity
+                      key={playType}
+                      style={[styles.segmentButton, recordForm.playType === playType && styles.segmentButtonActive]}
+                      onPress={() => setRecordForm((form) => ({ ...form, playType }))}
+                    >
+                      <Text style={[styles.segmentText, recordForm.playType === playType && styles.segmentTextActive]}>{playType}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+              </View>
+              <RecordField
+                label="Gain in yards"
+                value={recordForm.gain}
+                onChangeText={(gain) => setRecordForm((form) => ({ ...form, gain }))}
+                placeholder="e.g. 5"
+                keyboardType="numeric"
+                style={styles.recordHalfField}
+              />
+            </View>
+            <RecordField
+              label="Result / call (optional)"
+              value={recordForm.resultCall}
+              onChangeText={(resultCall) => setRecordForm((form) => ({ ...form, resultCall }))}
+              placeholder="Defaults to play family"
+            />
+            {recordMessage ? (
+              <Text style={recordMessage.startsWith('Play #') ? styles.recordSuccess : styles.recordError}>
+                {recordMessage}
+              </Text>
+            ) : null}
+            <TouchableOpacity style={styles.recordSubmitButton} onPress={addRecordedPlay}>
+              <Text style={styles.recordSubmitText}>Save play</Text>
+            </TouchableOpacity>
+          </View>
+
+          <View style={styles.recordCard}>
+            <View style={styles.recordListHeader}>
+              <Text style={styles.recordSectionTitle}>Recent plays</Text>
+              <Text style={styles.recordCount}>{dataset.length}</Text>
+            </View>
+            {dataset.length === 0 ? (
+              <Text style={styles.recordDescription}>No plays yet. Add one above or import a CSV.</Text>
+            ) : (
+              dataset.slice(-5).reverse().map((play, index) => (
+                <View key={`${play.clip}-${index}`} style={styles.recentPlayRow}>
+                  <View style={styles.recentPlayMain}>
+                    <Text style={styles.recentPlayTitle}>#{play.clip} · {play.playFamily}</Text>
+                    <Text style={styles.recentPlayMeta}>{play.downDistBucket} · {play.formation} · {play.yardline}</Text>
+                  </View>
+                  <Text style={styles.recentPlayGain}>{play.gain} yds</Text>
+                </View>
+              ))
+            )}
+          </View>
+        </ScrollView>
+      ) : (
+        <ScrollView contentContainerStyle={styles.settingsContent} keyboardShouldPersistTaps="handled">
+          <View style={styles.recordIntro}>
+            <Text style={styles.recordTitle}>Settings</Text>
+            <Text style={styles.recordDescription}>
+              Choose a playbook source. Cloud mode loads the CSV from your saved URL.
+            </Text>
+          </View>
+
+          <View style={styles.recordCard}>
+            <Text style={styles.recordSectionTitle}>Data storage</Text>
+            <Text style={styles.recordDescription}>
+              Choose where you intend to keep your playbook.
+            </Text>
+            <View style={styles.storageModeOptions}>
+              {[
+                { value: 'local', label: 'Local' },
+                { value: 'cloud', label: 'Cloud' },
+              ].map((option) => (
+                <TouchableOpacity
+                  key={option.value}
+                  style={[
+                    styles.storageModeButton,
+                    storageMode === option.value && styles.storageModeButtonActive,
+                  ]}
+                  onPress={() => selectStorageMode(option.value)}
+                  disabled={!settingsReady || !storageReady}
+                  accessibilityRole="button"
+                  accessibilityState={{ selected: storageMode === option.value, disabled: !settingsReady || !storageReady }}
+                >
+                  <Text style={[
+                    styles.storageModeText,
+                    storageMode === option.value && styles.storageModeTextActive,
+                  ]}>
+                    {option.label}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+            <Text style={styles.settingsStatus} accessibilityLiveRegion="polite">
+              {storageModeMessage}
+            </Text>
+            {storageMode === 'cloud' && (
+              <TouchableOpacity
+                style={[styles.actionButton, cloudLoading && styles.settingsButtonDisabled]}
+                onPress={() => setCloudRefreshKey((key) => key + 1)}
+                disabled={cloudLoading || !cloudCsvUrl.trim()}
+                accessibilityRole="button"
+              >
+                <Text style={styles.actionText}>{cloudLoading ? 'Loading cloud CSV…' : 'Reload cloud CSV'}</Text>
+              </TouchableOpacity>
+            )}
+          </View>
+
+          <View style={styles.recordCard}>
+            <Text style={styles.recordSectionTitle}>Cloud CSV</Text>
+            <Text style={styles.recordDescription}>
+              Drive CSV files load through the authenticated Cloud Run proxy. Published Google Sheets can still be loaded publicly without the proxy.
+            </Text>
+            <View style={styles.recordField}>
+              <Text style={styles.recordFieldLabel}>GOOGLE DRIVE FILE OR SHEETS URL</Text>
+              <TextInput
+                value={cloudCsvUrlInput}
+                onChangeText={setCloudCsvUrlInput}
+                placeholder="https://drive.google.com/file/d/..."
+                placeholderTextColor={theme.muted}
+                keyboardType="url"
+                autoCapitalize="none"
+                autoCorrect={false}
+                style={styles.recordInput}
+                accessibilityLabel="Google Drive file or Sheets URL"
+              />
+            </View>
+            <Text style={styles.settingsNote}>
+              Private Drive access requires an authenticated Cloud Run proxy configured for this build and a Google account on its allowlist. Published Sheets remain public. Cloud mode is read-only; app changes are not uploaded.
+            </Text>
+            <Text style={styles.recordFieldLabel}>PRIVATE DRIVE ACCESS</Text>
+            {!googleIdToken ? (
+              <TouchableOpacity
+                style={[
+                  styles.recordSubmitButton,
+                  (!googleClientIdConfigured || !googleRequest) && styles.settingsButtonDisabled,
+                ]}
+                onPress={startGoogleSignIn}
+                disabled={!googleClientIdConfigured || !googleRequest}
+                accessibilityRole="button"
+              >
+                <Text style={styles.recordSubmitText}>Sign in with Google</Text>
+              </TouchableOpacity>
+            ) : (
+              <TouchableOpacity
+                style={styles.clearUrlButton}
+                onPress={signOutOfCloud}
+                accessibilityRole="button"
+              >
+                <Text style={styles.clearUrlButtonText}>Sign out of Google</Text>
+              </TouchableOpacity>
+            )}
+            <Text style={styles.settingsStatus} accessibilityLiveRegion="polite">
+              {googleAuthMessage || (googleClientIdConfigured
+                ? 'Google sign-in is required to load a private Drive CSV.'
+                : 'Google sign-in is not configured in this app build.')}
+            </Text>
+            <Text style={styles.settingsStatus} accessibilityLiveRegion="polite">
+              {settingsMessage}
+            </Text>
+            {storageMode === 'cloud' && (
+              <Text style={styles.settingsStatus} accessibilityLiveRegion="polite">
+                {cloudLoadMessage}
+              </Text>
+            )}
+            <View style={styles.settingsUrlActions}>
+              <TouchableOpacity
+                style={[styles.recordSubmitButton, styles.settingsUrlAction, !settingsReady && styles.settingsButtonDisabled]}
+                onPress={saveCloudCsvUrl}
+                disabled={!settingsReady}
+                accessibilityRole="button"
+              >
+                <Text style={styles.recordSubmitText}>Save cloud URL</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.clearUrlButton, styles.settingsUrlAction, !settingsReady && styles.settingsButtonDisabled]}
+                onPress={clearCloudCsvUrl}
+                disabled={!settingsReady}
+                accessibilityRole="button"
+              >
+                <Text style={styles.clearUrlButtonText}>Clear URL</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </ScrollView>
+      )}
 
       <DropdownModal
         visible={Boolean(modalConfig)}
@@ -764,6 +1482,49 @@ export default function App() {
               </TouchableOpacity>
               <TouchableOpacity style={styles.confirmClearButton} onPress={clearDataset}>
                 <Text style={styles.confirmClearText}>Clear Data</Text>
+              </TouchableOpacity>
+            </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
+      <Modal
+        visible={cloudUrlPromptVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={cancelCloudUrlPrompt}
+      >
+        <Pressable style={styles.confirmOverlay} onPress={cancelCloudUrlPrompt}>
+          <Pressable style={styles.confirmCard} onPress={() => {}}>
+            <Text style={styles.confirmTitle}>Cloud URL required</Text>
+            <Text style={styles.confirmDescription}>
+              No cloud CSV URL is saved. Paste a Drive CSV file URL to load it through the authenticated proxy, or a published Google Sheets URL for public access.
+            </Text>
+            <TextInput
+              value={cloudUrlDraft}
+              onChangeText={setCloudUrlDraft}
+              placeholder="https://drive.google.com/file/d/..."
+              placeholderTextColor={theme.muted}
+              keyboardType="url"
+              autoCapitalize="none"
+              autoCorrect={false}
+              style={[styles.recordInput, styles.cloudUrlPromptInput]}
+              accessibilityLabel="Cloud CSV URL to load"
+            />
+            {!!cloudUrlPromptError && <Text style={styles.recordError}>{cloudUrlPromptError}</Text>}
+            <View style={styles.confirmActions}>
+              <TouchableOpacity
+                style={styles.cancelButton}
+                onPress={cancelCloudUrlPrompt}
+                disabled={cloudUrlSaving}
+              >
+                <Text style={styles.cancelButtonText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.recordSubmitButton, styles.cloudUrlSaveButton, cloudUrlSaving && styles.settingsButtonDisabled]}
+                onPress={saveCloudUrlAndLoad}
+                disabled={cloudUrlSaving}
+              >
+                <Text style={styles.recordSubmitText}>{cloudUrlSaving ? 'Saving…' : 'Save & load CSV'}</Text>
               </TouchableOpacity>
             </View>
           </Pressable>
@@ -857,6 +1618,8 @@ const styles = StyleSheet.create({
     paddingHorizontal: 18,
     paddingVertical: 14,
   },
+  cloudUrlPromptInput: { marginTop: 14 },
+  cloudUrlSaveButton: { flex: 1 },
   headerLeft: { flexDirection: 'row', alignItems: 'center', gap: 10 },
   logo: {
     width: 36,
@@ -899,7 +1662,108 @@ const styles = StyleSheet.create({
   clearDataButtonDisabled: { opacity: 0.45 },
   clearDataText: { color: '#fca5a5', fontSize: 12, fontWeight: '700' },
   clearDataTextDisabled: { color: '#94a3b8' },
+  navigation: {
+    flexDirection: 'row',
+    gap: 8,
+    paddingHorizontal: 16,
+    paddingVertical: 9,
+    backgroundColor: '#0b1220',
+    borderBottomWidth: 1,
+    borderBottomColor: theme.border,
+  },
+  navItem: { paddingHorizontal: 14, paddingVertical: 9, borderRadius: 9 },
+  navItemActive: { backgroundColor: 'rgba(52, 211, 153, 0.14)' },
+  navItemText: { color: theme.muted, fontSize: 12, fontWeight: '700' },
+  navItemTextActive: { color: theme.emerald },
   content: { padding: 16, gap: 18 },
+  recordScreenContent: { padding: 16, gap: 14 },
+  settingsContent: { padding: 16, gap: 14, width: '100%', maxWidth: 760, alignSelf: 'center' },
+  storageModeOptions: { flexDirection: 'row', gap: 10, marginTop: 2 },
+  storageModeButton: {
+    flex: 1,
+    minHeight: 44,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 14,
+    backgroundColor: theme.bg,
+    borderWidth: 1,
+    borderColor: '#334155',
+    borderRadius: 10,
+  },
+  storageModeButtonActive: {
+    backgroundColor: 'rgba(52, 211, 153, 0.14)',
+    borderColor: theme.emerald,
+  },
+  storageModeText: { color: theme.muted, fontSize: 13, fontWeight: '700' },
+  storageModeTextActive: { color: theme.emerald },
+  recordIntro: { paddingVertical: 4 },
+  recordTitle: { color: theme.white, fontSize: 22, fontWeight: '800' },
+  recordDescription: { color: theme.muted, fontSize: 12, lineHeight: 18, marginTop: 6 },
+  recordCount: { color: theme.emerald, fontSize: 11, fontWeight: '700', marginTop: 8 },
+  recordCard: {
+    padding: 16,
+    gap: 13,
+    backgroundColor: theme.panel,
+    borderWidth: 1,
+    borderColor: theme.border,
+    borderRadius: 16,
+  },
+  recordSectionTitle: { color: theme.text, fontSize: 14, fontWeight: '700' },
+  recordFieldsRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 12 },
+  recordHalfField: { flex: 1, minWidth: 170 },
+  recordField: { gap: 6 },
+  recordFieldLabel: { color: theme.muted, fontSize: 10, fontWeight: '700', letterSpacing: 0.5 },
+  recordInput: {
+    color: theme.text,
+    fontSize: 13,
+    backgroundColor: theme.bg,
+    borderWidth: 1,
+    borderColor: '#334155',
+    borderRadius: 9,
+    paddingHorizontal: 11,
+    paddingVertical: 10,
+    minHeight: 40,
+  },
+  settingsNote: { color: theme.muted, fontSize: 11, lineHeight: 17 },
+  settingsStatus: { color: theme.cyan, fontSize: 12, lineHeight: 18 },
+  settingsButtonDisabled: { opacity: 0.55 },
+  settingsUrlActions: { flexDirection: 'row', gap: 10 },
+  settingsUrlAction: { flex: 1 },
+  clearUrlButton: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 13,
+    backgroundColor: 'rgba(248, 113, 113, 0.1)',
+    borderWidth: 1,
+    borderColor: 'rgba(248, 113, 113, 0.45)',
+    borderRadius: 10,
+  },
+  clearUrlButtonText: { color: '#fca5a5', fontSize: 13, fontWeight: '800' },
+  segmentRow: { flexDirection: 'row', gap: 7 },
+  segmentButton: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    minHeight: 40,
+    paddingHorizontal: 10,
+    backgroundColor: theme.bg,
+    borderWidth: 1,
+    borderColor: '#334155',
+    borderRadius: 9,
+  },
+  segmentButtonActive: { backgroundColor: 'rgba(52, 211, 153, 0.14)', borderColor: theme.emerald },
+  segmentText: { color: theme.muted, fontSize: 12, fontWeight: '700' },
+  segmentTextActive: { color: theme.emerald },
+  recordSuccess: { color: theme.emerald, fontSize: 12, lineHeight: 18 },
+  recordError: { color: theme.red, fontSize: 12, lineHeight: 18 },
+  recordSubmitButton: { alignItems: 'center', paddingVertical: 13, backgroundColor: theme.emerald, borderRadius: 10 },
+  recordSubmitText: { color: '#03150f', fontSize: 13, fontWeight: '800' },
+  recordListHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  recentPlayRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 10, borderTopWidth: 1, borderTopColor: theme.border },
+  recentPlayMain: { flex: 1, gap: 4 },
+  recentPlayTitle: { color: theme.text, fontSize: 12, fontWeight: '700' },
+  recentPlayMeta: { color: theme.muted, fontSize: 10 },
+  recentPlayGain: { color: theme.amber, fontSize: 11, fontWeight: '700', marginLeft: 10 },
   statsGrid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
@@ -971,6 +1835,7 @@ const styles = StyleSheet.create({
   },
   filterValue: { color: theme.text, fontSize: 12 },
   filterChevron: { color: '#94a3b8', fontSize: 14 },
+  downDistanceHint: { color: theme.muted, fontSize: 10, marginTop: 12 },
   panel: { borderWidth: 1, borderColor: '#1e293b', borderRadius: 18, backgroundColor: '#0b1220', overflow: 'hidden' },
   panelHeader: { paddingHorizontal: 16, paddingVertical: 14, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', borderBottomWidth: 1, borderColor: '#1e293b' },
   panelTitle: { color: '#e2e8f0', fontWeight: '700', fontSize: 14 },
