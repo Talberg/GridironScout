@@ -18,10 +18,20 @@ import {
 import Constants from 'expo-constants';
 import * as DocumentPicker from 'expo-document-picker';
 import * as FileSystem from 'expo-file-system';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Google from 'expo-auth-session/providers/google';
 import * as WebBrowser from 'expo-web-browser';
+import * as Sharing from 'expo-sharing';
 import { fetchDriveCsvThroughProxy, getGoogleDriveFileId } from './cloudProxy';
+import DriveChart from './DriveChart';
+import {
+  APP_DATA_KEY,
+  loadAppData,
+  parseAppDataText,
+  replaceAppData,
+  serializeAppData,
+  updateAppData,
+  updateTeamPlaybook,
+} from './appDataStore';
 import {
   getCsvDownloadUrl,
   isGoogleSheetsUrl,
@@ -35,9 +45,6 @@ import {
 import {
   createTeamScheduleEntry,
   DEFAULT_TEAM,
-  getTeamDatasetKey,
-  isStoredTeamSchedule,
-  TEAM_SCHEDULE_KEY,
 } from './teamSchedule';
 
 WebBrowser.maybeCompleteAuthSession();
@@ -115,9 +122,6 @@ const theme = {
   green: '#4ade80',
   white: '#ffffff',
 };
-const LOCAL_DATA_KEY = 'gridiron-scout.dataset.v1';
-const LOCAL_CSV_URL_KEY = 'gridiron-scout.cloud-csv-url.v1';
-const STORAGE_MODE_KEY = 'gridiron-scout.storage-mode.v1';
 const SCOUT_TABS = [
   { id: 'field-zones', label: 'Field Zones', icon: '◉', field: 'fieldZone', accent: theme.rose },
   { id: 'down-distance', label: 'Down & Distance', icon: '↕', field: 'downDistBucket', accent: theme.amber },
@@ -307,15 +311,6 @@ function cloudCsvLoadError(error, sourceUrl) {
     return 'Connection failed. This CSV host may block browser access (CORS). Use a publicly published Google Sheets URL or a CSV host that allows cross-origin requests.';
   }
   return `Could not load cloud CSV: ${detail} Confirm the link serves a CSV and that the file is shared for access.`;
-}
-
-function isStoredPlaybook(value) {
-  return Array.isArray(value?.plays) && value.plays.every((play) => (
-    play &&
-    typeof play.clip === 'string' &&
-    typeof play.downDistBucket === 'string' &&
-    typeof play.gain === 'number'
-  ));
 }
 
 function compactNumber(value) {
@@ -707,6 +702,11 @@ export default function App() {
   const [uploadDestinationTeamId, setUploadDestinationTeamId] = useState(selectedTeamId);
   const [uploadWeekPickerVisible, setUploadWeekPickerVisible] = useState(false);
   const [clearConfirmVisible, setClearConfirmVisible] = useState(false);
+  const [backupStatus, setBackupStatus] = useState('');
+  const [backupBusy, setBackupBusy] = useState(false);
+  const [backupImportPreview, setBackupImportPreview] = useState(null);
+  const [backupImportVisible, setBackupImportVisible] = useState(false);
+  const [appDataRevision, setAppDataRevision] = useState(0);
   const [activeSection, setActiveSection] = useState('dashboard');
   const [activeScoutTab, setActiveScoutTab] = useState('formations');
   const [scoutTabPickerVisible, setScoutTabPickerVisible] = useState(false);
@@ -749,105 +749,65 @@ export default function App() {
 
   useEffect(() => {
     let active = true;
-    const restoreCloudCsvUrl = async () => {
-      try {
-        const [savedUrl, savedMode] = await Promise.all([
-          AsyncStorage.getItem(LOCAL_CSV_URL_KEY),
-          AsyncStorage.getItem(STORAGE_MODE_KEY),
-        ]);
-        if (!active) return;
-        setCloudCsvUrl(savedUrl || '');
-        setCloudCsvUrlInput(savedUrl || '');
-        setSettingsMessage(savedUrl ? 'Cloud CSV URL saved on this device.' : 'No cloud CSV URL configured.');
-        const mode = savedMode === 'cloud' ? 'cloud' : 'local';
-        setStorageMode(mode);
-        setStorageModeMessage(mode === 'cloud'
-          ? 'Cloud mode selected. Loading the saved CSV…'
-          : 'Local mode selected. Play data saves on this device.');
-      } catch (error) {
-        if (active) setSettingsMessage(`Could not load settings: ${error.message}`);
-        if (active) setStorageModeMessage(`Could not load storage preference: ${error.message}`);
-      } finally {
-        if (active) setSettingsReady(true);
-      }
-    };
-    restoreCloudCsvUrl();
-    return () => {
-      active = false;
-    };
-  }, []);
-
-  useEffect(() => {
-    let active = true;
     const restoreLocalData = async () => {
       try {
-        const [savedValue, savedScheduleValue, savedMode] = await Promise.all([
-          AsyncStorage.getItem(LOCAL_DATA_KEY),
-          AsyncStorage.getItem(TEAM_SCHEDULE_KEY),
-          AsyncStorage.getItem(STORAGE_MODE_KEY),
-        ]);
+        const { data, migrated, created } = await loadAppData();
         if (!active) return;
-
-        let restoredSchedule = null;
-        if (savedScheduleValue) {
-          try {
-            const parsedSchedule = JSON.parse(savedScheduleValue);
-            if (isStoredTeamSchedule(parsedSchedule)) {
-              restoredSchedule = parsedSchedule;
-            } else {
-              setStorageMessage('Saved team schedule is invalid. A new default schedule was created.');
-            }
-          } catch (error) {
-            setStorageMessage(`Could not read the saved team schedule: ${error.message}`);
-          }
-        }
-
-        if (!restoredSchedule) {
-          restoredSchedule = {
-            teams: [DEFAULT_TEAM],
-            selectedTeamId: DEFAULT_TEAM.id,
-          };
-          if (savedValue) {
-            const legacyPlaybook = JSON.parse(savedValue);
-            if (isStoredPlaybook(legacyPlaybook)) {
-              await AsyncStorage.setItem(getTeamDatasetKey(DEFAULT_TEAM.id), savedValue);
-            } else {
-              setStorageMessage('Saved data could not be read. The sample dataset is loaded.');
-            }
-          }
-          await AsyncStorage.setItem(TEAM_SCHEDULE_KEY, JSON.stringify(restoredSchedule));
-        }
-
-        const restoredTeamId = restoredSchedule.selectedTeamId;
-        const restoredTeam = restoredSchedule.teams.find((team) => team.id === restoredTeamId);
-        const teamValue = await AsyncStorage.getItem(getTeamDatasetKey(restoredTeamId));
-        const localValue = teamValue || (
-          restoredTeamId === DEFAULT_TEAM.id && !savedScheduleValue ? savedValue : null
-        );
-        setTeamSchedule(restoredSchedule);
+        const restoredTeamId = data.schedule.selectedTeamId;
+        const restoredTeam = data.schedule.teams.find((team) => team.id === restoredTeamId);
+        const localPlaybook = data.teams[restoredTeamId]?.playbook;
+        setTeamSchedule(data.schedule);
         setSelectedTeamId(restoredTeamId);
-
-        if (localValue) {
-          const saved = JSON.parse(localValue);
-          if (isStoredPlaybook(saved)) {
-            const plays = refreshDownDistanceBuckets(saved.plays);
-            setDataset(plays);
-            setRawRowCount(Number.isInteger(saved.rowCount) ? saved.rowCount : plays.length);
-            setDatasetName(typeof saved.name === 'string' ? saved.name : 'Saved dataset');
-          } else {
-            setStorageMessage('Saved team data could not be read. The sample dataset is loaded.');
+        setStorageMode('local');
+        setCloudCsvUrl(data.preferences.cloudCsvUrl);
+        setCloudCsvUrlInput(data.preferences.cloudCsvUrl);
+        setSettingsMessage(data.preferences.cloudCsvUrl
+          ? 'Cloud CSV URL saved on this device. Cloud mode is temporarily disabled.'
+          : 'No cloud CSV URL configured.');
+        setStorageModeMessage('Local mode selected. Play data saves on this device.');
+        let savedModeError = null;
+        if (data.preferences.storageMode === 'cloud') {
+          try {
+            await updateAppData((current) => ({
+              ...current,
+              preferences: { ...current.preferences, storageMode: 'local' },
+            }));
+          } catch (error) {
+            savedModeError = error;
           }
-        } else if (savedScheduleValue) {
+        }
+        if (!active) return;
+        if (localPlaybook) {
+          const plays = refreshDownDistanceBuckets(localPlaybook.plays);
+          setDataset(plays);
+          setRawRowCount(Number.isInteger(localPlaybook.rowCount) ? localPlaybook.rowCount : plays.length);
+          setDatasetName(typeof localPlaybook.name === 'string' ? localPlaybook.name : 'Saved dataset');
+        } else if (created) {
+          setDataset(sampleData.plays);
+          setRawRowCount(sampleData.rowCount);
+          setDatasetName('Sample dataset');
+        } else {
           setDataset([]);
           setRawRowCount(0);
           setDatasetName(`${restoredTeam.name} playbook`);
-        } else if (savedMode === 'cloud') {
-          setStorageMessage('Cloud mode is active. Fetching the configured CSV…');
         }
+        const restoreMessages = [];
+        if (migrated) restoreMessages.push('Existing saved data was combined into one JSON document.');
+        if (savedModeError) {
+          restoreMessages.push(`Cloud mode was disabled for this session, but the saved preference could not be updated: ${savedModeError.message}`);
+        }
+        if (restoreMessages.length > 0) setStorageMessage(restoreMessages.join(' '));
+        setSettingsReady(true);
       } catch (error) {
-        if (active) setStorageMessage(`Could not load saved data: ${error.message}`);
+        if (active) {
+          setStorageMessage(`Could not load saved data: ${error.message}`);
+          setSettingsMessage(`Could not load saved data: ${error.message}`);
+        }
       } finally {
-        if (active) setStorageReady(true);
+        if (active) {
+          setSettingsReady(true);
+          setStorageReady(true);
+        }
       }
     };
     restoreLocalData();
@@ -931,11 +891,7 @@ export default function App() {
         name: datasetName,
       };
       try {
-        const serialized = JSON.stringify(playbook);
-        await Promise.all([
-          AsyncStorage.setItem(getTeamDatasetKey(selectedTeamId), serialized),
-          AsyncStorage.setItem(LOCAL_DATA_KEY, serialized),
-        ]);
+        await updateAppData((current) => updateTeamPlaybook(current, selectedTeamId, playbook));
         if (active) setStorageMessage('Saved locally on this device');
       } catch (error) {
         if (active) setStorageMessage(`Could not save data locally: ${error.message}`);
@@ -962,15 +918,12 @@ export default function App() {
 
   const saveCurrentTeamData = async () => {
     if (storageMode !== 'local') return;
-    const serialized = JSON.stringify({
+    const playbook = {
       plays: dataset,
       rowCount: rawRowCount,
       name: datasetName,
-    });
-    await Promise.all([
-      AsyncStorage.setItem(getTeamDatasetKey(selectedTeamId), serialized),
-      AsyncStorage.setItem(LOCAL_DATA_KEY, serialized),
-    ]);
+    };
+    await updateAppData((current) => updateTeamPlaybook(current, selectedTeamId, playbook));
   };
 
   const selectScheduleTeam = async (teamId) => {
@@ -986,19 +939,13 @@ export default function App() {
 
     try {
       await saveCurrentTeamData();
+      let savedAppData = await loadAppData();
       let nextPlaybook = { plays: [], rowCount: 0, name: `${nextTeam.name} playbook` };
       if (storageMode === 'local') {
-        const savedValue = await AsyncStorage.getItem(getTeamDatasetKey(teamId));
-        if (savedValue) {
-          const saved = JSON.parse(savedValue);
-          if (!isStoredPlaybook(saved)) {
-            throw new Error(`Saved play data for ${nextTeam.name} is invalid.`);
-          }
-          nextPlaybook = saved;
-        }
+        nextPlaybook = savedAppData.data.teams[teamId]?.playbook || nextPlaybook;
       }
       const nextSchedule = { ...teamSchedule, selectedTeamId: teamId };
-      await AsyncStorage.setItem(TEAM_SCHEDULE_KEY, JSON.stringify(nextSchedule));
+      await updateAppData((current) => ({ ...current, schedule: nextSchedule }));
       setTeamSchedule(nextSchedule);
       setSelectedTeamId(teamId);
       setDataset(refreshDownDistanceBuckets(nextPlaybook.plays));
@@ -1028,16 +975,18 @@ export default function App() {
       teams: [...teamSchedule.teams, team],
       selectedTeamId: team.id,
     };
-    const emptyPlaybook = JSON.stringify({
+    const emptyPlaybook = {
       plays: [],
       rowCount: 0,
       name: `${team.name} playbook`,
-    });
+    };
 
     try {
       await saveCurrentTeamData();
-      await AsyncStorage.setItem(getTeamDatasetKey(team.id), emptyPlaybook);
-      await AsyncStorage.setItem(TEAM_SCHEDULE_KEY, JSON.stringify(nextSchedule));
+      await updateAppData((current) => ({
+        ...updateTeamPlaybook(current, team.id, emptyPlaybook),
+        schedule: nextSchedule,
+      }));
       setTeamSchedule(nextSchedule);
       setSelectedTeamId(team.id);
       setDataset([]);
@@ -1123,13 +1072,11 @@ export default function App() {
     setUploadBusy(true);
     setUploadError('');
     try {
-      const serialized = JSON.stringify(playbook);
-      await Promise.all([
-        AsyncStorage.setItem(getTeamDatasetKey(destinationTeam.id), serialized),
-        AsyncStorage.setItem(LOCAL_DATA_KEY, serialized),
-        AsyncStorage.setItem(STORAGE_MODE_KEY, 'local'),
-        AsyncStorage.setItem(TEAM_SCHEDULE_KEY, JSON.stringify(nextSchedule)),
-      ]);
+      await updateAppData((current) => ({
+        ...updateTeamPlaybook(current, destinationTeam.id, playbook),
+        schedule: nextSchedule,
+        preferences: { ...current.preferences, storageMode: 'local' },
+      }));
       setTeamSchedule(nextSchedule);
       setSelectedTeamId(destinationTeam.id);
       setDataset(uploadPreview.plays);
@@ -1164,7 +1111,12 @@ export default function App() {
     setClearConfirmVisible(false);
   };
 
-  const addRecordedPlay = () => {
+  const addRecordedPlay = async () => {
+    if (!storageReady) {
+      setRecordMessage('Saved app data is still loading. Try again in a moment.');
+      return;
+    }
+
     const play = normalizePlayRecord({
       Clip: recordForm.clip.trim() || String(rawRowCount + 1),
       Down: recordForm.down,
@@ -1185,8 +1137,11 @@ export default function App() {
       return;
     }
 
-    setDataset((current) => [...current, play]);
-    setRawRowCount((count) => count + 1);
+    const nextDataset = [...dataset, play];
+    const nextRowCount = rawRowCount + 1;
+    const nextDatasetName = 'Updated playbook';
+    setDataset(nextDataset);
+    setRawRowCount(nextRowCount);
     setDatasetName('Updated playbook');
     setFilters({ downDist: 'ALL', fieldZone: 'ALL', formation: 'ALL', backSet: 'ALL', playFamily: 'ALL', query: '' });
     setRecordForm({
@@ -1202,9 +1157,25 @@ export default function App() {
       gain: '',
       resultCall: '',
     });
-    setRecordMessage(storageMode === 'cloud'
-      ? `Play #${play.clip} added as a temporary local edit. It is not saved or written to the cloud CSV.`
-      : `Play #${play.clip} recorded. It is saved locally with your playbook.`);
+    if (storageMode === 'cloud') {
+      setRecordMessage(
+        `Play #${play.clip} added as a temporary local edit. It is not saved or written to the cloud CSV.`,
+      );
+      return;
+    }
+
+    try {
+      await updateAppData((current) => updateTeamPlaybook(
+        current,
+        selectedTeamId,
+        { plays: nextDataset, rowCount: nextRowCount, name: nextDatasetName },
+      ));
+      setStorageMessage('Saved locally on this device');
+      setRecordMessage(`Play #${play.clip} recorded. It is saved locally with your playbook.`);
+    } catch (error) {
+      setStorageMessage(`Could not save data locally: ${error.message}`);
+      setRecordMessage(`Play #${play.clip} was added but could not be saved locally: ${error.message}`);
+    }
   };
 
   const filteredPlays = useMemo(() => {
@@ -1236,32 +1207,23 @@ export default function App() {
   });
 
   const selectStorageMode = async (mode) => {
-    if (mode === 'cloud' && !cloudCsvUrl.trim()) {
-      setCloudUrlDraft('');
-      setCloudUrlPromptError('');
-      setCloudUrlPromptVisible(true);
+    if (mode === 'cloud') {
+      setStorageModeMessage('Cloud mode is temporarily disabled. Your data continues to save locally.');
       return;
     }
 
     try {
       let localPlaybook = null;
       if (mode === 'local') {
-        const savedValue = await AsyncStorage.getItem(getTeamDatasetKey(selectedTeamId))
-          || (selectedTeamId === DEFAULT_TEAM.id ? await AsyncStorage.getItem(LOCAL_DATA_KEY) : null);
-        if (savedValue) {
-          const saved = JSON.parse(savedValue);
-          if (isStoredPlaybook(saved)) {
-            localPlaybook = saved;
-          } else {
-            throw new Error('Saved local play data is invalid.');
-          }
-        }
+        const saved = await loadAppData();
+        localPlaybook = saved.data.teams[selectedTeamId]?.playbook || null;
       }
-      await AsyncStorage.setItem(STORAGE_MODE_KEY, mode);
-      setStorageMode(mode);
-      if (mode === 'cloud') {
-        setStorageModeMessage('Cloud mode selected. Loading CSV from the saved URL…');
-      } else if (localPlaybook) {
+      await updateAppData((current) => ({
+        ...current,
+        preferences: { ...current.preferences, storageMode: mode },
+      }));
+      setStorageMode('local');
+      if (localPlaybook) {
         setDataset(refreshDownDistanceBuckets(localPlaybook.plays));
         setRawRowCount(Number.isInteger(localPlaybook.rowCount) ? localPlaybook.rowCount : localPlaybook.plays.length);
         setDatasetName(typeof localPlaybook.name === 'string' ? localPlaybook.name : 'Saved dataset');
@@ -1308,15 +1270,18 @@ export default function App() {
 
     try {
       if (trimmedUrl) {
-        await AsyncStorage.setItem(LOCAL_CSV_URL_KEY, trimmedUrl);
+        await updateAppData((current) => ({
+          ...current,
+          preferences: { ...current.preferences, cloudCsvUrl: trimmedUrl, storageMode: 'local' },
+        }));
         setCloudCsvUrl(trimmedUrl);
         setCloudCsvUrlInput(trimmedUrl);
-        setSettingsMessage(storageMode === 'cloud'
-          ? 'Cloud CSV URL saved. Loading the latest data…'
-          : 'Cloud CSV URL saved on this device. Select Cloud to load it.');
-          if (storageMode === 'cloud') setCloudRefreshKey((key) => key + 1);
+        setSettingsMessage('Cloud CSV URL saved on this device. Cloud mode is temporarily disabled.');
       } else {
-        await AsyncStorage.removeItem(LOCAL_CSV_URL_KEY);
+        await updateAppData((current) => ({
+          ...current,
+          preferences: { ...current.preferences, cloudCsvUrl: '', storageMode: 'local' },
+        }));
         setSettingsMessage('Cloud CSV URL removed.');
         setCloudCsvUrl('');
         setCloudCsvUrlInput('');
@@ -1328,11 +1293,20 @@ export default function App() {
 
   const clearCloudCsvUrl = async () => {
     try {
-      await AsyncStorage.removeItem(LOCAL_CSV_URL_KEY);
+      await updateAppData((current) => ({
+        ...current,
+        preferences: {
+          ...current.preferences,
+          cloudCsvUrl: '',
+          storageMode: 'local',
+        },
+      }));
       setCloudCsvUrl('');
       setCloudCsvUrlInput('');
       if (storageMode === 'cloud') {
-        await selectStorageMode('local');
+        setStorageMode('local');
+        setCloudLoading(false);
+        setStorageModeMessage('Local mode selected. Play data saves on this device.');
       }
       setSettingsMessage('Cloud CSV URL cleared.');
     } catch (error) {
@@ -1340,30 +1314,138 @@ export default function App() {
     }
   };
 
-  const saveCloudUrlAndLoad = async () => {
-    const trimmedUrl = cloudUrlDraft.trim();
-    const validationError = validateCloudCsvUrl(trimmedUrl);
-    if (validationError) {
-      setCloudUrlPromptError(validationError);
-      return;
-    }
+  const saveCloudUrlAndLoad = () => {
+    setStorageModeMessage('Cloud mode is temporarily disabled. Your data continues to save locally.');
+    setCloudUrlPromptVisible(false);
+  };
 
-    setCloudUrlSaving(true);
-    setCloudUrlPromptError('');
+  const exportAppBackup = async () => {
+    setBackupBusy(true);
+    setBackupStatus('');
     try {
-      await Promise.all([
-        AsyncStorage.setItem(LOCAL_CSV_URL_KEY, trimmedUrl),
-        AsyncStorage.setItem(STORAGE_MODE_KEY, 'cloud'),
-      ]);
-      setCloudCsvUrl(trimmedUrl);
-      setCloudCsvUrlInput(trimmedUrl);
-      setStorageMode('cloud');
-      setCloudUrlPromptVisible(false);
-      setSettingsMessage('Cloud CSV URL saved. Loading the latest data…');
+      const { data } = await loadAppData();
+      const json = serializeAppData(data);
+      const fileName = 'gridiron-scout-backup.json';
+
+      if (Platform.OS === 'web') {
+        if (!globalThis.document || !globalThis.URL?.createObjectURL) {
+          throw new Error('JSON download is not available in this browser.');
+        }
+        const blob = new Blob([json], { type: 'application/json;charset=utf-8' });
+        const url = globalThis.URL.createObjectURL(blob);
+        const link = globalThis.document.createElement('a');
+        link.href = url;
+        link.download = fileName;
+        globalThis.document.body.appendChild(link);
+        link.click();
+        globalThis.document.body.removeChild(link);
+        setTimeout(() => globalThis.URL.revokeObjectURL(url), 1000);
+        setBackupStatus('JSON backup downloaded. It contains the schedule, playbooks, drive charts, notes, and app preferences.');
+      } else {
+        if (!FileSystem.documentDirectory) {
+          throw new Error('The app documents folder is not available on this device.');
+        }
+        const uri = `${FileSystem.documentDirectory}${fileName}`;
+        await FileSystem.writeAsStringAsync(uri, json, {
+          encoding: FileSystem.EncodingType.UTF8,
+        });
+        if (await Sharing.isAvailableAsync()) {
+          await Sharing.shareAsync(uri, {
+            mimeType: 'application/json',
+            dialogTitle: 'Export Gridiron Scout data',
+            UTI: 'public.json',
+          });
+          setBackupStatus('JSON backup exported. It contains the schedule, playbooks, drive charts, notes, and app preferences.');
+        } else {
+          setBackupStatus(`JSON backup saved in the app documents folder: ${uri}`);
+        }
+      }
     } catch (error) {
-      setCloudUrlPromptError(`Could not save the cloud URL: ${error.message}`);
+      setBackupStatus(`Could not export JSON backup: ${error.message}`);
     } finally {
-      setCloudUrlSaving(false);
+      setBackupBusy(false);
+    }
+  };
+
+  const importAppBackup = async () => {
+    setBackupBusy(true);
+    setBackupStatus('');
+    try {
+      const result = await DocumentPicker.getDocumentAsync({
+        type: '*/*',
+        copyToCacheDirectory: true,
+        multiple: false,
+      });
+      if (result.canceled) return;
+      const file = result.assets?.[0];
+      if (!file) throw new Error('The selected backup file could not be accessed.');
+
+      let text;
+      if (file.file && typeof file.file.text === 'function') {
+        text = await file.file.text();
+      } else if (/^(blob:|https?:)/i.test(file.uri)) {
+        const response = await fetch(file.uri);
+        if (!response.ok) throw new Error(`Could not read the selected file (HTTP ${response.status}).`);
+        text = await response.text();
+      } else {
+        text = await FileSystem.readAsStringAsync(file.uri, {
+          encoding: FileSystem.EncodingType.UTF8,
+        });
+      }
+
+      const data = parseAppDataText(text);
+      setBackupImportPreview({ data, name: file.name || 'JSON backup' });
+      setBackupImportVisible(true);
+      setBackupStatus(`Validated ${file.name || 'JSON backup'}. Review before replacing the current app data.`);
+    } catch (error) {
+      setBackupStatus(`Could not import JSON backup: ${error.message}`);
+    } finally {
+      setBackupBusy(false);
+    }
+  };
+
+  const confirmAppBackupImport = async () => {
+    if (!backupImportPreview) return;
+    setBackupBusy(true);
+    setBackupStatus('');
+    try {
+      const data = await replaceAppData({
+        ...backupImportPreview.data,
+        preferences: {
+          ...backupImportPreview.data.preferences,
+          storageMode: 'local',
+        },
+      });
+      const restoredTeam = data.schedule.teams.find(
+        (team) => team.id === data.schedule.selectedTeamId,
+      );
+      const restoredPlaybook = data.teams[data.schedule.selectedTeamId]?.playbook;
+      const plays = restoredPlaybook
+        ? refreshDownDistanceBuckets(restoredPlaybook.plays)
+        : [];
+
+      setTeamSchedule(data.schedule);
+      setSelectedTeamId(data.schedule.selectedTeamId);
+      setStorageMode('local');
+      setCloudCsvUrl(data.preferences.cloudCsvUrl);
+      setCloudCsvUrlInput(data.preferences.cloudCsvUrl);
+      setDataset(plays);
+      setRawRowCount(restoredPlaybook?.rowCount ?? plays.length);
+      setDatasetName(restoredPlaybook?.name || `${restoredTeam.name} playbook`);
+      setFilters({ downDist: 'ALL', fieldZone: 'ALL', formation: 'ALL', backSet: 'ALL', playFamily: 'ALL', query: '' });
+      setCloudLoading(false);
+      setSettingsMessage(data.preferences.cloudCsvUrl
+        ? 'Cloud CSV URL restored from JSON backup. Cloud mode is temporarily disabled.'
+        : 'No cloud CSV URL configured.');
+      setStorageModeMessage('Local mode selected. Play data saves on this device.');
+      setBackupImportVisible(false);
+      setBackupImportPreview(null);
+      setAppDataRevision((revision) => revision + 1);
+      setBackupStatus(`Restored ${backupImportPreview.name}. Schedule, playbooks, drive charts, notes, and preferences were imported with storage mode set to Local.`);
+    } catch (error) {
+      setBackupStatus(`Could not restore JSON backup: ${error.message}`);
+    } finally {
+      setBackupBusy(false);
     }
   };
 
@@ -1394,10 +1476,11 @@ export default function App() {
       <View style={styles.header}>
         <View style={styles.headerLeft}>
           <TouchableOpacity
-            style={styles.menuButton}
+            style={[styles.menuButton, !storageReady && styles.settingsButtonDisabled]}
             onPress={() => setTeamDrawerVisible(true)}
             accessibilityRole="button"
             accessibilityLabel="Open team menu"
+            disabled={!storageReady}
           >
             <Text style={styles.menuButtonText}>☰</Text>
           </TouchableOpacity>
@@ -1411,27 +1494,42 @@ export default function App() {
         </View>
         <View style={styles.headerButtons}>
           <TouchableOpacity
-            style={styles.actionButton}
+            style={[styles.actionButton, !storageReady && styles.settingsButtonDisabled]}
             onPress={() => {
               setUploadError('');
               setUploadDestinationTeamId(selectedTeamId);
               setUploadWeekPickerVisible(false);
               setUploadVisible(true);
             }}
+            disabled={!storageReady}
           >
             <Text style={styles.actionText}>Import CSV</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={styles.primaryButton} onPress={loadSampleDataset}>
+          <TouchableOpacity
+            style={[styles.primaryButton, !storageReady && styles.settingsButtonDisabled]}
+            onPress={loadSampleDataset}
+            disabled={!storageReady}
+          >
             <Text style={styles.primaryText}>Load Sample</Text>
           </TouchableOpacity>
           <TouchableOpacity
-            style={[styles.clearDataButton, dataset.length === 0 && styles.clearDataButtonDisabled]}
+            style={[
+              styles.clearDataButton,
+              (dataset.length === 0 || !storageReady) && styles.clearDataButtonDisabled,
+            ]}
             onPress={() => setClearConfirmVisible(true)}
-            disabled={dataset.length === 0}
+            disabled={dataset.length === 0 || !storageReady}
             accessibilityRole="button"
             accessibilityLabel="Clear all play data"
           >
-            <Text style={[styles.clearDataText, dataset.length === 0 && styles.clearDataTextDisabled]}>Clear Data</Text>
+            <Text
+              style={[
+                styles.clearDataText,
+                (dataset.length === 0 || !storageReady) && styles.clearDataTextDisabled,
+              ]}
+            >
+              Clear Data
+            </Text>
           </TouchableOpacity>
         </View>
       </View>
@@ -1550,7 +1648,11 @@ export default function App() {
 
         <View style={styles.scoutToolbar}>
           <Text style={styles.storageMessage}>
-            {storageMode === 'cloud' ? cloudLoadMessage : storageMessage || 'Saving data locally…'}
+            {!storageReady
+              ? 'Loading saved app data…'
+              : storageMode === 'cloud'
+                ? cloudLoadMessage
+                : storageMessage || 'Saving data locally…'}
           </Text>
           <View style={styles.scoutSearch}>
             <Text style={styles.searchPlaceholder}>⌕</Text>
@@ -1590,6 +1692,12 @@ export default function App() {
           <SnapLog plays={filteredPlays} />
         )}
       </ScrollView>
+      ) : activeSection === 'drive-chart' ? (
+        <DriveChart
+          key={`${selectedTeamId}:${appDataRevision}`}
+          teamId={selectedTeamId}
+          teamName={`${selectedTeam.name}${selectedTeam.week ? ` · Week ${selectedTeam.week}` : ''}`}
+        />
       ) : activeSection === 'record' ? (
         <ScrollView contentContainerStyle={styles.recordScreenContent} keyboardShouldPersistTaps="handled">
           <View style={styles.recordIntro}>
@@ -1704,7 +1812,11 @@ export default function App() {
                 {recordMessage}
               </Text>
             ) : null}
-            <TouchableOpacity style={styles.recordSubmitButton} onPress={addRecordedPlay}>
+            <TouchableOpacity
+              style={[styles.recordSubmitButton, !storageReady && styles.settingsButtonDisabled]}
+              onPress={addRecordedPlay}
+              disabled={!storageReady}
+            >
               <Text style={styles.recordSubmitText}>Save play</Text>
             </TouchableOpacity>
           </View>
@@ -1734,40 +1846,77 @@ export default function App() {
           <View style={styles.recordIntro}>
             <Text style={styles.recordTitle}>Settings</Text>
             <Text style={styles.recordDescription}>
-              Choose a playbook source. Cloud mode loads the CSV from your saved URL.
+              Playbooks and scouting data are saved locally on this device.
             </Text>
+          </View>
+
+          <View style={styles.recordCard}>
+            <Text style={styles.recordSectionTitle}>Unified app data</Text>
+            <Text style={styles.recordDescription}>
+              The app auto-saves all teams, schedule entries, playbooks, drive charts, sideline notes, and preferences together as one JSON document in local app storage ({APP_DATA_KEY}). Export a .json text backup or import one to move or restore everything. Google sign-in tokens are never included.
+            </Text>
+            <View style={styles.settingsUrlActions}>
+              <TouchableOpacity
+                style={[styles.recordSubmitButton, styles.settingsUrlAction, backupBusy && styles.settingsButtonDisabled]}
+                onPress={exportAppBackup}
+                disabled={backupBusy || !settingsReady || !storageReady}
+                accessibilityRole="button"
+              >
+                <Text style={styles.recordSubmitText}>{backupBusy ? 'Working…' : 'Export JSON backup'}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.clearUrlButton, styles.settingsUrlAction, backupBusy && styles.settingsButtonDisabled]}
+                onPress={importAppBackup}
+                disabled={backupBusy || !settingsReady || !storageReady}
+                accessibilityRole="button"
+              >
+                <Text style={styles.clearUrlButtonText}>Import JSON backup</Text>
+              </TouchableOpacity>
+            </View>
+            {!!backupStatus && (
+              <Text style={styles.settingsStatus} accessibilityLiveRegion="polite">
+                {backupStatus}
+              </Text>
+            )}
           </View>
 
           <View style={styles.recordCard}>
             <Text style={styles.recordSectionTitle}>Data storage</Text>
             <Text style={styles.recordDescription}>
-              Choose where you intend to keep your playbook.
+              Play data is saved locally on this device.
             </Text>
             <View style={styles.storageModeOptions}>
               {[
                 { value: 'local', label: 'Local' },
                 { value: 'cloud', label: 'Cloud' },
-              ].map((option) => (
-                <TouchableOpacity
-                  key={option.value}
-                  style={[
-                    styles.storageModeButton,
-                    storageMode === option.value && styles.storageModeButtonActive,
-                  ]}
-                  onPress={() => selectStorageMode(option.value)}
-                  disabled={!settingsReady || !storageReady}
-                  accessibilityRole="button"
-                  accessibilityState={{ selected: storageMode === option.value, disabled: !settingsReady || !storageReady }}
-                >
-                  <Text style={[
-                    styles.storageModeText,
-                    storageMode === option.value && styles.storageModeTextActive,
-                  ]}>
-                    {option.label}
-                  </Text>
-                </TouchableOpacity>
-              ))}
+              ].map((option) => {
+                const disabled = !settingsReady || !storageReady || option.value === 'cloud';
+                return (
+                  <TouchableOpacity
+                    key={option.value}
+                    style={[
+                      styles.storageModeButton,
+                      storageMode === option.value && styles.storageModeButtonActive,
+                      disabled && styles.settingsButtonDisabled,
+                    ]}
+                    onPress={() => selectStorageMode(option.value)}
+                    disabled={disabled}
+                    accessibilityRole="button"
+                    accessibilityState={{ selected: storageMode === option.value, disabled }}
+                  >
+                    <Text style={[
+                      styles.storageModeText,
+                      storageMode === option.value && styles.storageModeTextActive,
+                    ]}>
+                      {option.value === 'cloud' ? 'Cloud (Temporarily disabled)' : option.label}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
             </View>
+            <Text style={styles.settingsNote}>
+              Cloud mode is temporarily disabled. Previously saved Cloud preferences are switched to Local automatically.
+            </Text>
             <Text style={styles.settingsStatus} accessibilityLiveRegion="polite">
               {storageModeMessage}
             </Text>
@@ -1786,7 +1935,7 @@ export default function App() {
           <View style={styles.recordCard}>
             <Text style={styles.recordSectionTitle}>Cloud CSV</Text>
             <Text style={styles.recordDescription}>
-              Drive CSV files load through the authenticated Cloud Run proxy. Published Google Sheets can still be loaded publicly without the proxy.
+              Cloud CSV loading is temporarily disabled. You can keep a CSV URL saved here; it will not be loaded while Cloud mode is unavailable.
             </Text>
             <View style={styles.recordField}>
               <Text style={styles.recordFieldLabel}>GOOGLE DRIVE FILE OR SHEETS URL</Text>
@@ -1803,34 +1952,7 @@ export default function App() {
               />
             </View>
             <Text style={styles.settingsNote}>
-              Private Drive access requires an authenticated Cloud Run proxy configured for this build and a Google account on its allowlist. Published Sheets remain public. Cloud mode is read-only; app changes are not uploaded.
-            </Text>
-            <Text style={styles.recordFieldLabel}>PRIVATE DRIVE ACCESS</Text>
-            {!googleIdToken ? (
-              <TouchableOpacity
-                style={[
-                  styles.recordSubmitButton,
-                  (!googleClientIdConfigured || !googleRequest) && styles.settingsButtonDisabled,
-                ]}
-                onPress={startGoogleSignIn}
-                disabled={!googleClientIdConfigured || !googleRequest}
-                accessibilityRole="button"
-              >
-                <Text style={styles.recordSubmitText}>Sign in with Google</Text>
-              </TouchableOpacity>
-            ) : (
-              <TouchableOpacity
-                style={styles.clearUrlButton}
-                onPress={signOutOfCloud}
-                accessibilityRole="button"
-              >
-                <Text style={styles.clearUrlButtonText}>Sign out of Google</Text>
-              </TouchableOpacity>
-            )}
-            <Text style={styles.settingsStatus} accessibilityLiveRegion="polite">
-              {googleAuthMessage || (googleClientIdConfigured
-                ? 'Google sign-in is required to load a private Drive CSV.'
-                : 'Google sign-in is not configured in this app build.')}
+              Cloud CSV loading is temporarily disabled. Google sign-in and Cloud Run settings are not used.
             </Text>
             <Text style={styles.settingsStatus} accessibilityLiveRegion="polite">
               {settingsMessage}
@@ -1862,6 +1984,53 @@ export default function App() {
         </ScrollView>
       )}
 
+      <Modal
+        visible={backupImportVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => {
+          if (backupBusy) return;
+          setBackupImportVisible(false);
+          setBackupImportPreview(null);
+        }}
+      >
+        <Pressable
+          style={styles.confirmOverlay}
+          onPress={() => {
+            if (backupBusy) return;
+            setBackupImportVisible(false);
+            setBackupImportPreview(null);
+          }}
+        >
+          <Pressable style={styles.confirmCard} onPress={() => {}}>
+            <Text style={styles.confirmTitle}>Replace app data?</Text>
+            <Text style={styles.confirmDescription}>
+              Importing {backupImportPreview?.name || 'this backup'} replaces the current schedule, playbooks, drive charts, sideline notes, and preferences on this device.
+            </Text>
+            <View style={styles.confirmActions}>
+              <TouchableOpacity
+                style={styles.cancelButton}
+                onPress={() => {
+                  setBackupImportVisible(false);
+                  setBackupImportPreview(null);
+                }}
+                disabled={backupBusy}
+                accessibilityRole="button"
+              >
+                <Text style={styles.cancelButtonText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.recordSubmitButton, styles.cloudUrlSaveButton, backupBusy && styles.settingsButtonDisabled]}
+                onPress={confirmAppBackupImport}
+                disabled={backupBusy}
+                accessibilityRole="button"
+              >
+                <Text style={styles.recordSubmitText}>{backupBusy ? 'Restoring…' : 'Replace & restore'}</Text>
+              </TouchableOpacity>
+            </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
       <Modal
         visible={teamDrawerVisible}
         transparent
@@ -1900,6 +2069,7 @@ export default function App() {
                 {[
                   { id: 'dashboard', label: 'Dashboard' },
                   { id: 'record', label: 'Record Data' },
+                  { id: 'drive-chart', label: 'Drive Chart & Notes' },
                   { id: 'settings', label: 'Settings' },
                 ].map((section) => (
                   <TouchableOpacity
@@ -1920,7 +2090,7 @@ export default function App() {
                   <Text style={styles.drawerScheduleCount}>{teamSchedule.teams.length}</Text>
                 </View>
                 <Text style={styles.teamDrawerHint}>
-                  Each entry keeps its own playbook on this device. Cloud mode continues to use the configured shared CSV.
+                  Each entry keeps its own playbook on this device.
                 </Text>
                 {teamSchedule.teams.map((team) => {
                   const isSelected = team.id === selectedTeamId;
