@@ -526,18 +526,36 @@ export default function App() {
     setUploadBusy(true);
     try {
       const result = await DocumentPicker.getDocumentAsync({
-        type: ['text/csv', 'text/comma-separated-values', 'application/vnd.ms-excel'],
+        type: '*/*',
         copyToCacheDirectory: true,
         multiple: false,
       });
       if (result.canceled) return;
-      const file = result.assets[0];
-      const csvText = file.file && typeof file.file.text === 'function'
-        ? await file.file.text()
-        : await FileSystem.readAsStringAsync(file.uri);
+      const file = result.assets?.[0];
+      if (!file) {
+        throw new Error('The selected file could not be accessed. Please choose the CSV again.');
+      }
+
+      let csvText;
+      if (file.file && typeof file.file.text === 'function') {
+        csvText = await file.file.text();
+      } else if (/^(blob:|https?:)/i.test(file.uri)) {
+        const response = await fetch(file.uri);
+        if (!response.ok) {
+          throw new Error(`Could not read the selected file (HTTP ${response.status}).`);
+        }
+        csvText = await response.text();
+      } else {
+        csvText = await FileSystem.readAsStringAsync(file.uri, {
+          encoding: FileSystem.EncodingType.UTF8,
+        });
+      }
+
       const parsed = buildDataset(csvText);
       if (!parsed.plays.length) {
-        throw new Error('No valid plays were found. Check the required columns and row values below.');
+        throw new Error(
+          'No valid plays were found in this file. Choose a CSV with Down, Distance, Yardline, Formation, Play_Family, and Play_Type columns.',
+        );
       }
       setUploadPreview({ ...parsed, name: file.name || 'Imported CSV' });
     } catch (error) {

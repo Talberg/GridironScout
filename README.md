@@ -15,7 +15,7 @@ Press `w` in the Expo terminal to open the web app.
 
 1. Create a GitHub repository and push this project to its `main` branch.
 2. In the repository, open **Settings → Pages** and set the build and deployment source to **GitHub Actions**.
-3. Push to `main`, or run **Deploy Expo web to GitHub Pages** from the repository's **Actions** tab.
+3. Push to `main`, or run **Deploy React Native Web to GitHub Pages** from the repository's **Actions** tab.
 4. Once the workflow completes, use the Pages URL shown in the workflow deployment.
 
 The workflow builds the web export into `dist/` and publishes it. The Expo base URL is selected from the GitHub repository name at build time, so both project pages (`owner/repository`) and user or organization pages (`owner/owner.github.io`) use the correct asset paths.
